@@ -21,6 +21,17 @@ protects the whole thing.
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
 
+## v0.3.0
+
+- **Image preview** — image files show a real thumbnail in the file list;
+  click it for a full-size lightbox (Download + Close, Esc or click the
+  backdrop to close). Other files keep their big type icon.
+- **Bigger file icons** — 56×56 px tiles with a centred emoji.
+- **Equal panels** — Files and Clipboard are the same width and height;
+  each list scrolls inside its own panel.
+- **Fancy panel colours** — indigo/blue header for Files, emerald/teal
+  header for Clipboard, matching accents for their buttons.
+
 ## Install (Ubuntu server, one line)
 
 ```
@@ -38,7 +49,7 @@ web UI in the background, prints the address, and exits; run
 `loadinme menu` later to open the menu. `LOADINME_NO_MENU=1` skips the
 menu, `LOADINME_NO_WEB=1` skips starting the web UI.
 
-Specific version: `curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.2.0`
+Specific version: `curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.3.0`
 
 ## SSH menu
 
