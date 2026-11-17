@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -150,21 +153,107 @@ WantedBy=default.target
 	return nil
 }
 
+// errAlreadyRunning is returned by startService when the web UI is
+// already answering /health.
+var errAlreadyRunning = errors.New("web UI is already running")
+
+// probeHealth reports whether the web UI answers /health on localhost.
+// A live /health response is the definitive proof the UI is up, however
+// it was started (systemd, nohup, or by hand).
+func probeHealth(cfg Config) bool {
+	scheme := "http"
+	if cfg.TLSEnabled {
+		scheme = "https"
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	if cfg.TLSEnabled {
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // localhost probe of our own server
+	}
+	resp, err := client.Get(fmt.Sprintf("%s://127.0.0.1:%d/health", scheme, cfg.Port))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// waitHealthy waits up to ~10s for the web UI to answer /health.
+func waitHealthy(cfg Config) bool {
+	for i := 0; i < 20; i++ {
+		if probeHealth(cfg) {
+			return true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return false
+}
+
+// pidAlive reports whether a process with this PID exists (signal 0).
+// The old code used p.Signal(os.Signal(nil)), which always errors, so
+// the menu never reported the nohup process as running.
+func pidAlive(pid int) bool {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return p.Signal(syscall.Signal(0)) == nil
+}
+
+func pidFromFile(cfg Config) (int, bool) {
+	b, err := os.ReadFile(pidFile(cfg))
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// startService starts the web UI (systemd user service when available,
+// otherwise a nohup background process) and waits until /health
+// answers. It is idempotent: if the UI is already up it returns
+// errAlreadyRunning instead of starting a second copy.
 func startService(cfg Config) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return startServiceExe(cfg, exe)
+}
+
+func startServiceExe(cfg Config, exe string) error {
+	exe, _ = filepath.EvalSymlinks(exe)
+	if probeHealth(cfg) {
+		return errAlreadyRunning
+	}
+	// A fresh install has no data dir yet — the log file (and the
+	// daemon's database) need it to exist first.
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		return err
+	}
+	// Drop a stale PID file so it cannot mask a fresh start.
+	if pid, ok := pidFromFile(cfg); ok && !pidAlive(pid) {
+		_ = os.Remove(pidFile(cfg))
+	}
 	if hasSystemdUser() {
 		if err := installServiceFile(cfg); err != nil {
 			return fmt.Errorf("could not install service file: %w", err)
 		}
 		cmd := exec.Command("systemctl", "--user", "enable", "--now", "loadinme.service")
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		return cmd.Run()
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+		if !waitHealthy(cfg) {
+			return fmt.Errorf("service started but the web UI did not answer on port %d — check: systemctl --user status loadinme.service", cfg.Port)
+		}
+		return nil
 	}
 	// Fallback: nohup background process.
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	log, err := os.OpenFile(filepath.Join(cfg.DataDir, "loadinme.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	logPath := filepath.Join(cfg.DataDir, "loadinme.log")
+	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
@@ -175,7 +264,13 @@ func startService(cfg Config) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	return os.WriteFile(pidFile(cfg), []byte(strconv.Itoa(cmd.Process.Pid)), 0o644)
+	if err := os.WriteFile(pidFile(cfg), []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
+		return err
+	}
+	if !waitHealthy(cfg) {
+		return fmt.Errorf("web UI did not start on port %d (is the port already in use?) — check the log: %s", cfg.Port, logPath)
+	}
+	return nil
 }
 
 func stopService(cfg Config) error {
@@ -204,22 +299,18 @@ func stopService(cfg Config) error {
 }
 
 func isServiceRunning(cfg Config) bool {
+	// A live /health response wins: the UI is up however it was started
+	// (installer, systemd, nohup, or by hand).
+	if probeHealth(cfg) {
+		return true
+	}
 	if hasSystemdUser() {
 		return exec.Command("systemctl", "--user", "is-active", "--quiet", "loadinme.service").Run() == nil
 	}
-	b, err := os.ReadFile(pidFile(cfg))
-	if err != nil {
-		return false
+	if pid, ok := pidFromFile(cfg); ok {
+		return pidAlive(pid)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		return false
-	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return p.Signal(os.Signal(nil)) == nil
+	return false
 }
 
 func restartService(cfg Config) error {
@@ -402,7 +493,22 @@ func uninstall(cfg Config, scanner *bufio.Scanner) {
 	fmt.Println("LoadInMe is uninstalled.")
 }
 
-func runMenu(cfg *Config, store *Store) {
+// withStore opens the database for one short operation and closes it
+// again. The menu must NOT hold the database open: bbolt takes an
+// exclusive lock, so a menu holding it open would make the web UI
+// daemon fail to start with "could not open data store: timeout"
+// (v0.1.0 bug — the menu printed "Web UI started" while the daemon
+// had actually died).
+func withStore(cfg *Config, fn func(*Store) error) error {
+	store, err := OpenStore(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	return fn(store)
+}
+
+func runMenu(cfg *Config) {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for {
@@ -429,10 +535,12 @@ func runMenu(cfg *Config, store *Store) {
 		fmt.Println()
 		switch choice {
 		case "1":
-			if isServiceRunning(*cfg) {
-				fmt.Println("Web UI is already running at", webAddressFor(*cfg))
-			} else if err := startService(*cfg); err != nil {
-				fmt.Println("Could not start web UI:", err)
+			if err := startService(*cfg); err != nil {
+				if errors.Is(err, errAlreadyRunning) {
+					fmt.Println("Web UI is already running at", webAddressFor(*cfg))
+				} else {
+					fmt.Println("Could not start web UI:", err)
+				}
 			} else {
 				fmt.Println("Web UI started at", webAddressFor(*cfg))
 			}
@@ -458,13 +566,16 @@ func runMenu(cfg *Config, store *Store) {
 			fmt.Println("Domain:", cfg.Domain)
 			fmt.Println("SSL:", cfg.TLSEnabled)
 			fmt.Println("Data dir:", cfg.DataDir)
-			if st, err := store.GetSettings(); err == nil {
-				fmt.Printf("Limits: %d items max, %d MB per file, %d h default expiry\n",
-					st.MaxItems, st.MaxFileMB, st.DefaultExpiryHours)
-			}
-			if n, err := store.CountItems(); err == nil {
-				fmt.Println("Items stored:", n)
-			}
+			_ = withStore(cfg, func(store *Store) error {
+				if st, err := store.GetSettings(); err == nil {
+					fmt.Printf("Limits: %d items max, %d MB per file, %d h default expiry\n",
+						st.MaxItems, st.MaxFileMB, st.DefaultExpiryHours)
+				}
+				if n, err := store.CountItems(); err == nil {
+					fmt.Println("Items stored:", n)
+				}
+				return nil
+			})
 			pause(scanner)
 		case "5":
 			portStr := prompt(scanner, "Web port", strconv.Itoa(cfg.Port))
@@ -510,22 +621,31 @@ func runMenu(cfg *Config, store *Store) {
 			}
 			pause(scanner)
 		case "9":
-			if err := setPasswordCLI(store, ""); err != nil {
+			err := withStore(cfg, func(store *Store) error {
+				return setPasswordCLI(store, "")
+			})
+			if err != nil {
 				fmt.Println("Could not change password:", err)
 			}
 			pause(scanner)
 		case "10":
-			st, err := store.GetSettings()
-			if err != nil {
-				fmt.Println("Could not read settings:", err)
-			} else {
+			err := withStore(cfg, func(store *Store) error {
+				st, err := store.GetSettings()
+				if err != nil {
+					fmt.Println("Could not read settings:", err)
+					return nil
+				}
 				fmt.Printf("Max items: %d\nMax file size: %d MB\nDefault expiry: %d hours\n",
 					st.MaxItems, st.MaxFileMB, st.DefaultExpiryHours)
-			}
-			if name, _, _ := store.GetUser(); name != "" {
-				fmt.Println("Login user:", name)
-			} else {
-				fmt.Println("Login user: (none set yet — open the web UI to create one)")
+				if name, _, _ := store.GetUser(); name != "" {
+					fmt.Println("Login user:", name)
+				} else {
+					fmt.Println("Login user: (none set yet — open the web UI to create one)")
+				}
+				return nil
+			})
+			if err != nil {
+				fmt.Println("Could not open data store:", err)
 			}
 			pause(scanner)
 		case "11":
