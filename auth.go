@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -61,38 +62,59 @@ func (s *Store) clearSessionCookie(w http.ResponseWriter) {
 	})
 }
 
-// setPasswordCLI implements `loadinme set-password [username]`.
-// It reads the password from stdin (twice, must match) and stores
-// the bcrypt hash. Used on first install and from the SSH menu.
-func setPasswordCLI(store *Store, username string) error {
+// errCancelled is returned when the user types exactly "0" at a
+// prompt. In the menu it means "cancel this step" (or exit), never a
+// value — "0" must never become a username, password, port or domain.
+var errCancelled = errors.New("cancelled")
+
+// setPasswordCLI implements `loadinme set-password [username]` and its
+// alias `loadinme reset-password [username]`. It reads the password
+// from stdin (twice, must match) and stores the bcrypt hash. It never
+// asks for the current/old password: a reset must work when the old
+// password is forgotten. On success it clears every login session, so
+// all browsers/devices are logged out and the new password is required.
+// Pass scanner=nil to read from os.Stdin (CLI use); the menu passes its
+// own scanner so input is not lost between two buffered readers.
+func setPasswordCLI(store *Store, username string, scanner *bufio.Scanner) error {
 	existing, _, _ := store.GetUser()
 	if username == "" {
 		username = existing
 	}
-	scanner := bufio.NewScanner(os.Stdin)
+	if scanner == nil {
+		scanner = bufio.NewScanner(os.Stdin)
+	}
 	if username == "" {
-		fmt.Print("Username: ")
+		fmt.Print("Username (0 to cancel): ")
 		if !scanner.Scan() {
 			return fmt.Errorf("no username given")
 		}
 		username = strings.TrimSpace(scanner.Text())
+		if username == "0" {
+			return errCancelled
+		}
 		if username == "" {
 			return fmt.Errorf("username cannot be empty")
 		}
 	} else {
 		fmt.Println("Username:", username)
 	}
-	fmt.Print("New password: ")
+	fmt.Print("New password (0 to cancel): ")
 	if !scanner.Scan() {
 		return fmt.Errorf("no password given")
 	}
 	pw := scanner.Text()
+	if strings.TrimSpace(pw) == "0" {
+		return errCancelled
+	}
 	if len(pw) < 4 {
 		return fmt.Errorf("password must be at least 4 characters")
 	}
-	fmt.Print("Repeat password: ")
+	fmt.Print("Repeat password (0 to cancel): ")
 	if !scanner.Scan() {
 		return fmt.Errorf("no password given")
+	}
+	if strings.TrimSpace(scanner.Text()) == "0" {
+		return errCancelled
 	}
 	if scanner.Text() != pw {
 		return fmt.Errorf("passwords do not match")
@@ -104,6 +126,9 @@ func setPasswordCLI(store *Store, username string) error {
 	if err := store.SetUser(username, hash); err != nil {
 		return err
 	}
-	fmt.Printf("Password set for user %q.\n", username)
+	if err := store.ClearSessions(); err != nil {
+		return fmt.Errorf("password set but could not log out old sessions: %w", err)
+	}
+	fmt.Printf("Password reset for user %q. All sessions were logged out — log in again with the new password.\n", username)
 	return nil
 }
