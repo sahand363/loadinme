@@ -298,12 +298,24 @@ func healthOK(t *testing.T, port int) bool {
 
 func waitHealth(t *testing.T, port int, want bool) {
 	t.Helper()
+	waitHealthOrFail(t, port, want, "")
+}
+
+// waitHealthOrFail is waitHealth with extra context (e.g. the menu's
+// or the reset command's captured output) included in the failure
+// message, so a CI failure shows what the process actually printed
+// instead of only "health never became true".
+func waitHealthOrFail(t *testing.T, port int, want bool, extra string) {
+	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if healthOK(t, port) == want {
 			return
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	if extra != "" {
+		t.Fatalf("health on port %d never became %v\n%s", port, want, extra)
 	}
 	t.Fatalf("health on port %d never became %v", port, want)
 }
@@ -844,7 +856,7 @@ func TestResetPasswordWhileServerRunning(t *testing.T) {
 	if !strings.Contains(string(resetOut), "logged out") {
 		t.Fatalf("reset output missing logout notice: %q", resetOut)
 	}
-	waitHealth(t, port, true)
+	waitHealthOrFail(t, port, true, "reset-password output:\n"+string(resetOut))
 
 	if st := apiItemsStatus(t, port, oldCookie); st != http.StatusUnauthorized {
 		t.Fatalf("old cookie after reset: %d, want 401", st)
@@ -911,7 +923,7 @@ func TestMenuResetPasswordWhileRunning(t *testing.T) {
 	if !strings.Contains(menuOut, "Password reset for user") {
 		t.Fatalf("menu reset output missing success message:\n%s", menuOut)
 	}
-	waitHealth(t, port, true)
+	waitHealthOrFail(t, port, true, "menu output:\n"+menuOut)
 	if st := apiItemsStatus(t, port, oldCookie); st != http.StatusUnauthorized {
 		t.Fatalf("old cookie after menu reset: %d, want 401", st)
 	}
