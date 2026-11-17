@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoadInMe — Set up</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <h1>⬆ LoadInMe</h1>
+  <p>First run — create your login. You can change it later from the SSH menu or Settings.</p>
+  <form method="post" action="/setup">
+    <label>Username</label>
+    <input name="username" autocomplete="username" autofocus required>
+    <label>Password (at least 4 characters)</label>
+    <input type="password" name="password" autocomplete="new-password" required minlength="4">
+    <label>Repeat password</label>
+    <input type="password" name="confirm" autocomplete="new-password" required minlength="4">
+    <button class="btn" type="submit">Create login</button>
+  </form>
+  <div class="error" id="err"></div>
+</div>
+<script>
+  if (new URLSearchParams(location.search).get('error')) {
+    document.getElementById('err').textContent = 'Check the fields — username required, password at least 4 characters, and both passwords must match.';
+  }
+</script>
+</body>
+</html>
