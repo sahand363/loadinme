@@ -293,6 +293,62 @@ func (s *Store) handleDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
+// previewImageTypes maps safe image extensions (from the stored
+// filename, never the upload Content-Type) to their MIME types.
+// SVG is deliberately absent: it can carry scripts.
+var previewImageTypes = map[string]string{
+	"jpg":  "image/jpeg",
+	"jpeg": "image/jpeg",
+	"png":  "image/png",
+	"gif":  "image/gif",
+	"webp": "image/webp",
+	"bmp":  "image/bmp",
+}
+
+// handlePreview serves an image file INLINE for thumbnails / the
+// lightbox. Any other type gets 415; missing/expired/non-file
+// behaves like handleDownload.
+func (s *Store) handlePreview(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/p/")
+	id = strings.SplitN(id, "/", 2)[0]
+	it, err := s.GetItem(id)
+	if err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	if it.Kind != "file" {
+		http.Error(w, "not a file", http.StatusNotFound)
+		return
+	}
+	if it.IsExpired(time.Now().UTC()) {
+		_ = s.DeleteItem(it.ID)
+		http.Error(w, "file has expired", http.StatusGone)
+		return
+	}
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(it.Name)), ".")
+	mime, ok := previewImageTypes[ext]
+	if !ok {
+		http.Error(w, "no preview available for this file type", http.StatusUnsupportedMediaType)
+		return
+	}
+	path := s.uploadPath(it.ID)
+	f, err := os.Open(path)
+	if err != nil {
+		http.Error(w, "file not found on disk", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		http.Error(w, "file not found on disk", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	http.ServeContent(w, r, it.Name, fi.ModTime(), f)
+}
+
 func (s *Store) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
