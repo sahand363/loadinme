@@ -398,6 +398,35 @@ func TestPidAlive(t *testing.T) {
 	}
 }
 
+// v0.4.0: the generated systemd unit must disable systemd's
+// start-rate limiting. CI run #25 failed because the test suite
+// starts/stops the same loadinme.service unit many times in a row
+// and systemd refused with "start of the service was attempted too
+// often" — the unit sat in a failed state and the restart after a
+// menu password reset never came up. StartLimitIntervalSec=0 turns
+// the limit off, so menu/installer restarts can never be refused
+// for being "too often", on a VPS or in CI.
+func TestServiceFileDisablesStartRateLimit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := Config{Port: 18080, DataDir: t.TempDir()}
+	if err := installServiceFile(cfg); err != nil {
+		t.Fatalf("installServiceFile: %v", err)
+	}
+	b, err := os.ReadFile(serviceFilePath())
+	if err != nil {
+		t.Fatalf("read service file: %v", err)
+	}
+	s := string(b)
+	if !strings.Contains(s, "StartLimitIntervalSec=0") {
+		t.Fatalf("service file is missing StartLimitIntervalSec=0:\n%s", s)
+	}
+	// It must be a [Unit] setting (before [Service]), not a stray line.
+	if strings.Index(s, "StartLimitIntervalSec=0") > strings.Index(s, "[Service]") {
+		t.Fatalf("StartLimitIntervalSec=0 is not in the [Unit] section:\n%s", s)
+	}
+}
+
 // 12. `loadinme start` starts the UI (and /health answers), a second
 // start is a harmless no-op, `stop` stops it.
 func TestStartStopViaBinary(t *testing.T) {
