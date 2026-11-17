@@ -104,6 +104,39 @@
       </div>`).join('') : '<p class="empty">No clips yet — press Ctrl+V anywhere to save one.</p>';
   }
 
+  // Copy text to the clipboard. navigator.clipboard only exists in
+  // secure contexts (https or localhost) — over plain http://<IP>
+  // it is undefined and writeText throws, so the Copy button did
+  // nothing at all. Fall back to the classic off-screen textarea +
+  // document.execCommand('copy'), which works on plain http too.
+  // Returns true only when the text was really copied.
+  async function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(text); return true; }
+      catch (err) { console.warn('clipboard API copy failed, trying fallback:', err); }
+    }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-9999px';
+      ta.style.left = '-9999px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      // iOS Safari needs an explicit selection range as well.
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return !!ok;
+    } catch (err) {
+      console.error('copy fallback failed:', err);
+      return false;
+    }
+  }
+
   document.addEventListener('click', async (e) => {
     const pv = e.target.closest('[data-preview]');
     if (pv) { openLightbox(pv.dataset.preview); return; }
@@ -117,7 +150,10 @@
     const cp = e.target.closest('[data-copy]');
     if (cp) {
       const it = items.find((i) => i.id === cp.dataset.copy);
-      if (it) { await navigator.clipboard.writeText(it.text); cp.textContent = 'Copied!'; setTimeout(() => cp.textContent = 'Copy', 1200); }
+      if (!it) return;
+      const ok = await copyText(it.text);
+      cp.textContent = ok ? 'Copied!' : 'Copy failed';
+      setTimeout(() => cp.textContent = 'Copy', 1200);
     }
   });
 
