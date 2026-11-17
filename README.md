@@ -21,6 +21,11 @@ protects the whole thing.
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
 
+## v0.5.0
+
+- **Copy button fixed** — it did nothing over plain `http://<server-IP>` because `navigator.clipboard` only exists in secure contexts. It now falls back to the classic textarea + `execCommand('copy')` approach, shows 'Copied!' only on real success, and 'Copy failed' if copying really fails.
+- **Updates no longer reset your port** — an update used to start the UI on the 8080 default and permanently overwrite the saved port (the user's 5234 was lost this way in v0.4.0). Two causes fixed: the installer now reads the saved port from `config.json` even without python3 (grep fallback), and a `--port` / `LOADINME_PORT` override is one-off — starting the UI with one never writes it back to `config.json` again.
+
 ## v0.4.0
 
 - **Password reset from SSH, any time** — SSH menu option 9 is now
