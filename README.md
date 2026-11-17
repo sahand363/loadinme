@@ -21,6 +21,23 @@ protects the whole thing.
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
 
+## v0.4.0
+
+- **Password reset from SSH, any time** — SSH menu option 9 is now
+  "Reset / change username & password", and `loadinme reset-password`
+  does the same from the command line. It never asks for the old
+  password (a reset works even when the old one is forgotten), and it
+  logs out every browser/device, so the new password is required
+  everywhere.
+- **0 always exits the SSH menu** — pressing 0 exits the menu (no
+  farewell message), and typing 0 at any menu question cancels that
+  step instead of becoming a value (it can never set the port to 0, the
+  domain to "0", or the password to "0").
+- **Always restart after an update** — after a quick install or a menu
+  update (option 8), the web UI is stopped and started again with the
+  new version, and the running version is printed, so updates always
+  apply.
+
 ## v0.3.0
 
 - **Image preview** — image files show a real thumbnail in the file list;
@@ -49,7 +66,12 @@ web UI in the background, prints the address, and exits; run
 `loadinme menu` later to open the menu. `LOADINME_NO_MENU=1` skips the
 menu, `LOADINME_NO_WEB=1` skips starting the web UI.
 
-Specific version: `curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.3.0`
+Specific version: `curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.4.0`
+
+After installing or updating, the installer always restarts the web UI
+with the new version (stopping the old process first if it was
+running), so an update always applies. The menu's Update (option 8)
+does the same.
 
 ## SSH menu
 
@@ -64,12 +86,15 @@ Run `loadinme menu`. The web UI link is printed first, then:
 | 5 | Change port |
 | 6 | Set domain |
 | 7 | SSL with Let's Encrypt (needs a domain + certbot) |
-| 8 | Update LoadInMe (downloads the latest release binary) |
-| 9 | Change username / password |
+| 8 | Update LoadInMe (downloads the latest release binary, then restarts the web UI with it) |
+| 9 | Reset / change username & password (no old password needed; logs out all browsers) |
 | 10 | View settings |
 | 11 | Show web UI link |
 | 12 | Uninstall (asks whether to keep your data) |
 | 0 | Exit |
+
+Pressing 0 exits the menu, and typing 0 at any question cancels that
+step instead of becoming a value.
 
 The menu uses a systemd user service (`loadinme.service`) when
 systemctl is available, and falls back to a background process with a
@@ -83,9 +108,15 @@ loadinme start [--port 8080] [--data-dir ~/.loadinme]
 loadinme stop [--data-dir ~/.loadinme]
 loadinme menu
 loadinme set-password [username]
+loadinme reset-password [username]
 loadinme version
 loadinme --help
 ```
+
+`set-password` and `reset-password` are the same: they set a new
+password without asking for the old one, and log out every
+browser/device (all sessions are cleared). Use them any time, not
+just on first setup — from the SSH menu (option 9) or the command line.
 
 `start` starts the web UI in the background and waits until it answers
 `/health` (it does nothing if the UI is already running); `stop` stops
