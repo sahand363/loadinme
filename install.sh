@@ -7,16 +7,18 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash
 #
-# After installing, the installer starts the web UI (default port 8080)
-# and opens the SSH menu — the web UI link is on top of the menu.
+# After installing, the installer restarts the web UI with the new
+# version (default port 8080) and opens the SSH menu — the web UI link
+# is on top of the menu. If the UI was already running, the old process
+# is stopped first, so the update always applies.
 # Open the web UI in your browser and create your login on the setup
 # page. If there is no terminal (CI, a pipe without a TTY), it starts
 # the web UI in the background, prints the address, and exits instead
 # of hanging.
 #
-# Specific version (a git tag, e.g. v0.2.0):
-#   curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.2.0
-#   VERSION=v0.2.0 bash install.sh
+# Specific version (a git tag, e.g. v0.4.0):
+#   curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.4.0
+#   VERSION=v0.4.0 bash install.sh
 #
 # Flags: --version TAG | --install-dir DIR | --no-menu | --no-web
 #
@@ -102,8 +104,8 @@ elif ! curl -fsSL -o "$TMP/loadinme" "$URL"; then
   echo "" >&2
   echo "That usually means no release exists yet for this version." >&2
   echo "Create one first (from your laptop, in the repo):" >&2
-  echo "  git tag v0.2.0" >&2
-  echo "  git push origin v0.2.0" >&2
+  echo "  git tag v0.4.0" >&2
+  echo "  git push origin v0.4.0" >&2
   echo "Then wait a minute for GitHub Actions to build and publish" >&2
   echo "loadinme-linux-amd64 and loadinme-linux-arm64, and run this installer again." >&2
   echo "This installer does not fall back to compiling — the binary is the point." >&2
@@ -125,8 +127,12 @@ echo ""
 echo "Installed: $INSTALL_DIR/loadinme"
 BIN="$INSTALL_DIR/loadinme"
 
-# --- Start the web UI automatically (default port 8080) ---
+# --- Restart the web UI with the new version (default port 8080) ---
 # A port already saved in <data-dir>/config.json wins over the default.
+# The UI is ALWAYS restarted after an install/update, so the new
+# version actually applies: if it is already running, stop the old
+# process first, then start the new binary and verify /health. Never
+# skip the restart just because the old version is still running.
 PORT=8080
 if [ -f "$DATA_DIR/config.json" ]; then
   SAVED="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('port') or 8080)" "$DATA_DIR/config.json" 2>/dev/null || echo 8080)"
@@ -134,11 +140,27 @@ if [ -f "$DATA_DIR/config.json" ]; then
 fi
 LOG="$DATA_DIR/loadinme.log"
 if [ -z "${LOADINME_NO_WEB:-}" ]; then
+  OLD_RUNNING=0
   if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-    echo "Web UI is already running on port $PORT."
+    OLD_RUNNING=1
+    echo "Web UI is running — restarting it with the new version…"
+    "$BIN" stop --data-dir "$DATA_DIR" >/dev/null 2>&1 || true
+    # Wait until the old process is really gone (up to ~5s).
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      curl -fsS --max-time 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || break
+      sleep 0.5
+    done
+  fi
+  if [ "$OLD_RUNNING" = 1 ] && curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    echo "WARNING: the old web UI is still running — the update may not have applied." >&2
+    echo "Stop it by hand (loadinme stop) and start it again (loadinme start)." >&2
   elif "$BIN" start --port "$PORT" --data-dir "$DATA_DIR"; then
     if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-      echo "Web UI started on port $PORT."
+      if [ "$OLD_RUNNING" = 1 ]; then
+        echo "Web UI restarted on port $PORT ($("$BIN" version))."
+      else
+        echo "Web UI started on port $PORT ($("$BIN" version))."
+      fi
     else
       echo "WARNING: the web UI did not answer on port $PORT." >&2
     fi
