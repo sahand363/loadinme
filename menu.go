@@ -138,6 +138,13 @@ func installServiceFile(cfg Config) error {
 Description=LoadInMe — file and text sharing
 After=network-online.target
 Wants=network-online.target
+# systemd refuses to start a unit "too often" (default: 5 starts
+# in 10s) and leaves it in a failed state until someone runs
+# reset-failed. Menu restarts and installer restarts must never be
+# refused that way — and neither must a test suite that starts and
+# stops the same unit many times in a row (CI run #25 tripped this).
+# StartLimitIntervalSec=0 disables the rate limit entirely.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -293,6 +300,10 @@ func startServiceExe(cfg Config, exe string) error {
 		if err := installServiceFile(cfg); err != nil {
 			return fmt.Errorf("could not install service file: %w", err)
 		}
+		// Clear a failed state left by an earlier attempt (e.g. a
+		// rate-limited start before this fix), or enable --now below
+		// refuses to start the unit at all.
+		_ = exec.Command("systemctl", "--user", "reset-failed", "loadinme.service").Run()
 		cmd := exec.Command("systemctl", "--user", "enable", "--now", "loadinme.service")
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
