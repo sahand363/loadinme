@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -329,6 +331,20 @@ func TestInstallScriptAutoStart(t *testing.T) {
 			t.Fatalf("install.sh is missing %q", want)
 		}
 	}
+	// v0.4.0: after installing, the UI is ALWAYS restarted with the
+	// new version — the old "already running, skip the restart" path
+	// must be gone, and the script must stop the old process first,
+	// then start the new one and print its version.
+	for _, want := range []string{
+		"stop --data-dir", "Web UI restarted on port", "version",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("install.sh is missing restart-after-update %q", want)
+		}
+	}
+	if strings.Contains(s, "Web UI is already running on port") {
+		t.Fatal("install.sh still skips the restart when the UI is already running")
+	}
 	// The old manual flow must be gone: no "Next steps" block telling
 	// the user to run the menu and then start the UI by hand.
 	if strings.Contains(s, "Next steps:") {
@@ -615,5 +631,292 @@ func TestPreviewUnauthRedirect(t *testing.T) {
 	}
 	if loc := resp.Header.Get("Location"); loc != "/login" {
 		t.Fatalf("unauth preview Location = %q, want /login", loc)
+	}
+}
+
+// --- v0.4.0: password reset logs out all sessions; 0 cancels; restart after update ---
+
+func setTestUser(t *testing.T, s *Store, password string) string {
+	t.Helper()
+	hash, err := hashPassword(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetUser("testuser", hash); err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.CreateSession("testuser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.SessionUser(token); !ok {
+		t.Fatal("new session did not verify")
+	}
+	return token
+}
+
+// 15a. Reset path (SetUser + ClearSessions): the old session token
+// stops working, the old password stops verifying, the new one works.
+func TestPasswordResetClearsSessions(t *testing.T) {
+	s := testStore(t)
+	token := setTestUser(t, s, "oldpass123")
+
+	newHash, err := hashPassword("newpass123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetUser("testuser", newHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearSessions(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.SessionUser(token); ok {
+		t.Fatal("old session still valid after password reset")
+	}
+	_, hash, _ := s.GetUser()
+	if verifyPassword(hash, "oldpass123") {
+		t.Fatal("old password still verifies after reset")
+	}
+	if !verifyPassword(hash, "newpass123") {
+		t.Fatal("new password does not verify after reset")
+	}
+}
+
+// 15b. Typing "0" at a set-password prompt cancels (errCancelled) and
+// changes nothing: not at the username prompt, not at the password prompt.
+func TestSetPasswordCancelOnZero(t *testing.T) {
+	// No user yet: "0" at the username prompt cancels, no user created.
+	s := testStore(t)
+	sc := bufio.NewScanner(strings.NewReader("0\n"))
+	if err := setPasswordCLI(s, "", sc); !errors.Is(err, errCancelled) {
+		t.Fatalf("username-prompt 0: err = %v, want errCancelled", err)
+	}
+	if has, _ := s.HasUser(); has {
+		t.Fatal("cancelled reset still created a user")
+	}
+
+	// Existing user: "0" at the new-password prompt cancels, hash unchanged.
+	s2 := testStore(t)
+	_ = setTestUser(t, s2, "oldpass123")
+	sc2 := bufio.NewScanner(strings.NewReader("0\n"))
+	if err := setPasswordCLI(s2, "", sc2); !errors.Is(err, errCancelled) {
+		t.Fatalf("password-prompt 0: err = %v, want errCancelled", err)
+	}
+	_, hash, _ := s2.GetUser()
+	if !verifyPassword(hash, "oldpass123") {
+		t.Fatal("cancelled reset changed the password")
+	}
+}
+
+// 15c. A successful reset via setPasswordCLI logs out the old session.
+func TestSetPasswordResetLogsOut(t *testing.T) {
+	s := testStore(t)
+	token := setTestUser(t, s, "oldpass123")
+	sc := bufio.NewScanner(strings.NewReader("newpass123\nnewpass123\n"))
+	if err := setPasswordCLI(s, "", sc); err != nil {
+		t.Fatalf("setPasswordCLI: %v", err)
+	}
+	if _, ok := s.SessionUser(token); ok {
+		t.Fatal("old session still valid after CLI password reset")
+	}
+	_, hash, _ := s.GetUser()
+	if !verifyPassword(hash, "newpass123") {
+		t.Fatal("new password does not verify after CLI reset")
+	}
+}
+
+// 15d. promptCancel: "0" cancels, a value is returned as-is, an empty
+// answer keeps the default.
+func TestPromptCancelZero(t *testing.T) {
+	sc := bufio.NewScanner(strings.NewReader("0\n"))
+	if _, cancelled := promptCancel(sc, "Web port", "8080"); !cancelled {
+		t.Fatal("promptCancel(\"0\") did not cancel")
+	}
+	sc = bufio.NewScanner(strings.NewReader("9090\n"))
+	if v, cancelled := promptCancel(sc, "Web port", "8080"); cancelled || v != "9090" {
+		t.Fatalf("promptCancel(\"9090\") = (%q, %v), want (\"9090\", false)", v, cancelled)
+	}
+	sc = bufio.NewScanner(strings.NewReader("\n"))
+	if v, cancelled := promptCancel(sc, "Web port", "8080"); cancelled || v != "8080" {
+		t.Fatalf("promptCancel(\"\") = (%q, %v), want (\"8080\", false)", v, cancelled)
+	}
+}
+
+// 15e. The menu prints no farewell: "Bye" must not appear anywhere in
+// the Go sources, and choosing 0 exits the menu silently.
+func TestMenuNoBye(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".go") || e.Name() == "main_test.go" {
+			continue // this test file itself mentions "Bye" in its comment
+		}
+		b, err := os.ReadFile(e.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(b), "Bye") {
+			t.Fatalf("%s still contains \"Bye\"", e.Name())
+		}
+	}
+}
+
+// --- v0.4.0 (continued): reset while the server is running ---
+
+// loginViaHTTP logs in over HTTP and returns the session cookie
+// ("" when the login failed) and the login response status.
+func loginViaHTTP(t *testing.T, port int, username, password string) (string, int) {
+	t.Helper()
+	form := url.Values{"username": {username}, "password": {password}}
+	resp, err := noRedirectClient().PostForm(fmt.Sprintf("http://127.0.0.1:%d/login", port), form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	cookie := resp.Header.Get("Set-Cookie")
+	if i := strings.Index(cookie, ";"); i >= 0 {
+		cookie = cookie[:i]
+	}
+	return cookie, resp.StatusCode
+}
+
+func apiItemsStatus(t *testing.T, port int, cookie string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/api/items", port), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+func createUserViaCLI(t *testing.T, bin, dataDir, input string) {
+	t.Helper()
+	cmd := exec.Command(bin, "set-password", "--data-dir", dataDir)
+	cmd.Stdin = strings.NewReader(input)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("set-password: %v\n%s", err, out)
+	}
+}
+
+// 16a. `reset-password` while the server is running: the CLI must stop
+// the UI, reset, and restart it. Old cookie dies (401), old password
+// fails, new password works, /health answers afterwards.
+func TestResetPasswordWhileServerRunning(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	createUserViaCLI(t, bin, dataDir, "testuser\noldpass123\noldpass123\n")
+
+	out, err := runBin(t, bin, "start", "--port", strconv.Itoa(port), "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("start: %v\n%s", err, out)
+	}
+	waitHealth(t, port, true)
+	defer func() { _, _ = runBin(t, bin, "stop", "--data-dir", dataDir) }()
+
+	oldCookie, code := loginViaHTTP(t, port, "testuser", "oldpass123")
+	if code != http.StatusSeeOther || oldCookie == "" {
+		t.Fatalf("login with old password: status %d, cookie %q", code, oldCookie)
+	}
+	if st := apiItemsStatus(t, port, oldCookie); st != http.StatusOK {
+		t.Fatalf("old cookie /api/items: %d, want 200", st)
+	}
+
+	cmd := exec.Command(bin, "reset-password", "--data-dir", dataDir)
+	cmd.Stdin = strings.NewReader("newpass123\nnewpass123\n")
+	resetOut, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("reset-password while running: %v\n%s", err, resetOut)
+	}
+	if !strings.Contains(string(resetOut), "logged out") {
+		t.Fatalf("reset output missing logout notice: %q", resetOut)
+	}
+	waitHealth(t, port, true)
+
+	if st := apiItemsStatus(t, port, oldCookie); st != http.StatusUnauthorized {
+		t.Fatalf("old cookie after reset: %d, want 401", st)
+	}
+	if badCookie, _ := loginViaHTTP(t, port, "testuser", "oldpass123"); badCookie != "" {
+		t.Fatal("old password still logs in after reset")
+	}
+	newCookie, _ := loginViaHTTP(t, port, "testuser", "newpass123")
+	if newCookie == "" || apiItemsStatus(t, port, newCookie) != http.StatusOK {
+		t.Fatal("new password does not log in after reset")
+	}
+}
+
+// 16b. Menu option 9 while the server is running: same flow through
+// the menu — stop, reset, restart, no farewell, server still up.
+func TestMenuResetPasswordWhileRunning(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	createUserViaCLI(t, bin, dataDir, "testuser\noldpass123\noldpass123\n")
+
+	out, err := runBin(t, bin, "start", "--port", strconv.Itoa(port), "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("start: %v\n%s", err, out)
+	}
+	waitHealth(t, port, true)
+	defer func() { _, _ = runBin(t, bin, "stop", "--data-dir", dataDir) }()
+
+	oldCookie, _ := loginViaHTTP(t, port, "testuser", "oldpass123")
+	if oldCookie == "" {
+		t.Fatal("could not log in before menu reset")
+	}
+
+	cmd := exec.Command(bin, "menu", "--port", strconv.Itoa(port), "--data-dir", dataDir)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// 9 = reset password, new password twice, Enter at the pause, 0 = exit.
+	if _, err := io.WriteString(stdin, "9\nnewpass123\nnewpass123\n\n0\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdin.Close()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("menu exited with error: %v\noutput:\n%s", err, buf.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("menu did not exit\noutput:\n%s", buf.String())
+	}
+	menuOut := buf.String()
+	if strings.Contains(menuOut, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", menuOut)
+	}
+	if !strings.Contains(menuOut, "Password reset for user") {
+		t.Fatalf("menu reset output missing success message:\n%s", menuOut)
+	}
+	waitHealth(t, port, true)
+	if st := apiItemsStatus(t, port, oldCookie); st != http.StatusUnauthorized {
+		t.Fatalf("old cookie after menu reset: %d, want 401", st)
+	}
+	newCookie, _ := loginViaHTTP(t, port, "testuser", "newpass123")
+	if newCookie == "" || apiItemsStatus(t, port, newCookie) != http.StatusOK {
+		t.Fatal("new password does not log in after menu reset")
 	}
 }
