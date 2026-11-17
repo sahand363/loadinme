@@ -12,12 +12,14 @@ a { color: #0b57d0; }
 .logout { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 14px; }
 .logout:hover { background: #f0f0ee; }
 
-.layout { display: flex; gap: 16px; padding: 16px 18px; align-items: flex-start; }
-.panel { background: #fff; border: 1px solid #e3e3e0; border-radius: 12px; padding: 14px; }
-.files-panel { flex: 1.6; min-width: 0; }
-.clips-panel { flex: 1; min-width: 280px; }
-.panel h2 { margin: 0 0 10px; font-size: 16px; }
-.panel .hint { color: #777; font-size: 13px; margin: -4px 0 12px; }
+.layout { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 18px; align-items: stretch; }
+.panel { background: #fff; border: 1px solid #e3e3e0; border-radius: 12px; display: flex; flex-direction: column; min-height: calc(100vh - 140px); overflow: hidden; }
+.panel-head { padding: 14px; border-radius: 12px 12px 0 0; }
+.panel-head h2 { margin: 0; font-size: 16px; color: #fff; }
+.files-head { background: linear-gradient(135deg, #6366f1, #0b57d0); }
+.clips-head { background: linear-gradient(135deg, #10b981, #0d9488); }
+.panel-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 14px; overflow: hidden; }
+.panel .hint { color: #777; font-size: 13px; margin: 0 0 12px; }
 
 .toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
 .btn { background: #0b57d0; color: #fff; border: none; border-radius: 8px; padding: 8px 14px; cursor: pointer; font-size: 14px; }
@@ -29,12 +31,16 @@ a { color: #0b57d0; }
 .btn.small { padding: 4px 9px; font-size: 13px; }
 
 .dropzone { border: 2px dashed #c9c9c6; border-radius: 10px; padding: 18px; text-align: center; color: #777; margin-bottom: 12px; transition: all .15s; }
-.dropzone.over { border-color: #0b57d0; background: #eef4ff; color: #0b57d0; }
+.files-panel .dropzone.over { border-color: #6366f1; background: #eef2ff; color: #4338ca; }
+.files-panel .progress-wrap .bar i { background: #6366f1; }
+.clips-panel .btn { background: #0d9488; }
+.clips-panel .btn:hover { background: #0f766e; }
 
-.file-list { list-style: none; margin: 0; padding: 0; }
+.file-list { list-style: none; margin: 0; padding: 0; flex: 1; min-height: 0; overflow-y: auto; }
 .file-row { display: flex; align-items: center; gap: 10px; padding: 9px 6px; border-top: 1px solid #f0f0ee; }
 .file-row:hover { background: #fafafa; }
-.file-icon { font-size: 22px; width: 28px; text-align: center; }
+.file-icon { font-size: 28px; width: 56px; height: 56px; flex: 0 0 56px; display: flex; align-items: center; justify-content: center; background: #eef2ff; border-radius: 12px; }
+.file-thumb { width: 56px; height: 56px; flex: 0 0 56px; object-fit: cover; border-radius: 12px; cursor: zoom-in; background: #eef2ff; display: block; }
 .file-meta { flex: 1; min-width: 0; }
 .file-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .file-sub { color: #777; font-size: 12px; margin-top: 2px; }
@@ -49,6 +55,7 @@ a { color: #0b57d0; }
 .progress-wrap .bar i { display: block; height: 100%; background: #0b57d0; width: 0%; }
 
 .clip-form textarea { width: 100%; min-height: 80px; resize: vertical; border: 1px solid #ddd; border-radius: 8px; padding: 8px; font: inherit; font-size: 14px; }
+#clipList { flex: 1; min-height: 0; overflow-y: auto; }
 .clip-form .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 .clip-form label { font-size: 14px; color: #555; }
 .clip { border-top: 1px solid #f0f0ee; padding: 10px 2px; }
@@ -74,4 +81,10 @@ a { color: #0b57d0; }
 .login-wrap .btn { width: 100%; margin-top: 18px; }
 .login-wrap .error { color: #b3261e; font-size: 14px; margin-top: 10px; }
 
-@media (max-width: 900px) { .layout { flex-direction: column; } .clips-panel { width: 100%; } }
+.lightbox { align-items: center; justify-content: center; padding: 20px; background: rgba(0,0,0,.7); }
+.lightbox-card { background: #fff; border-radius: 12px; padding: 16px; max-width: 92vw; max-height: 92vh; display: flex; flex-direction: column; gap: 12px; }
+.lightbox-card img { max-width: 88vw; max-height: 72vh; object-fit: contain; border-radius: 8px; background: #111; align-self: center; }
+.lightbox-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; font-size: 14px; }
+.lightbox-meta .row { display: flex; gap: 8px; }
+
+@media (max-width: 900px) { .layout { grid-template-columns: 1fr; } .panel { min-height: 0; } }
