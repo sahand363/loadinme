@@ -133,10 +133,28 @@ BIN="$INSTALL_DIR/loadinme"
 # version actually applies: if it is already running, stop the old
 # process first, then start the new binary and verify /health. Never
 # skip the restart just because the old version is still running.
+#
+# saved_port prints the port from config.json, or 8080 when the file
+# has no valid port. python3 is tried first, but a plain grep/sed
+# fallback MUST work when python3 is missing — v0.4.0 used python3
+# only, so on a server without it the parse silently failed and the
+# update started the UI on 8080, wiping the user's saved port (5234).
+saved_port() {
+  local cfg="$1" p=""
+  if command -v python3 >/dev/null 2>&1; then
+    p="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('port') or '')" "$cfg" 2>/dev/null || true)"
+  fi
+  if [ -z "$p" ]; then
+    p="$(grep -o '"port"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$cfg" 2>/dev/null | head -1 | grep -o '[0-9][0-9]*' || true)"
+  fi
+  case "$p" in
+    ''|*[!0-9]*) echo 8080 ;;
+    *) if [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then echo "$p"; else echo 8080; fi ;;
+  esac
+}
 PORT=8080
 if [ -f "$DATA_DIR/config.json" ]; then
-  SAVED="$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('port') or 8080)" "$DATA_DIR/config.json" 2>/dev/null || echo 8080)"
-  case "$SAVED" in ''|*[!0-9]*) ;; *) PORT="$SAVED" ;; esac
+  PORT="$(saved_port "$DATA_DIR/config.json")"
 fi
 LOG="$DATA_DIR/loadinme.log"
 if [ -z "${LOADINME_NO_WEB:-}" ]; then
