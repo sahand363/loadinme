@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoadInMe — Log in</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <h1>⬆ LoadInMe</h1>
+  <p>Log in to see your files and clips.</p>
+  <form method="post" action="/login">
+    <label>Username</label>
+    <input name="username" autocomplete="username" autofocus required>
+    <label>Password</label>
+    <input type="password" name="password" autocomplete="current-password" required>
+    <button class="btn" type="submit">Log in</button>
+  </form>
+  <div class="error" id="err"></div>
+</div>
+<script>
+  if (new URLSearchParams(location.search).get('error')) {
+    document.getElementById('err').textContent = 'Wrong username or password. Try again.';
+  }
+</script>
+</body>
+</html>
