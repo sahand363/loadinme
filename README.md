@@ -28,17 +28,17 @@ curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh 
 ```
 
 No Go, no clone, no compile on the server — GitHub Actions builds the
-binary and the installer just downloads it. Then:
+binary and the installer just downloads it. The installer then starts
+the web UI by itself (default port 8080) and opens the SSH menu, with
+the web UI link right on top. Open the link in your browser and create
+your login on the setup page — no terminal setup needed after that.
 
-```
-export PATH="$HOME/.local/bin:$PATH"
-loadinme menu
-```
+If there is no terminal (a scripted install), the installer starts the
+web UI in the background, prints the address, and exits; run
+`loadinme menu` later to open the menu. `LOADINME_NO_MENU=1` skips the
+menu, `LOADINME_NO_WEB=1` skips starting the web UI.
 
-The SSH menu shows the web UI link right on top. Open it in your
-browser and create your login on the setup page.
-
-Specific version: `curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.1.0`
+Specific version: `curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.2.0`
 
 ## SSH menu
 
@@ -68,11 +68,20 @@ PID file otherwise.
 
 ```
 loadinme serve [--port 8080] [--data-dir ~/.loadinme]
+loadinme start [--port 8080] [--data-dir ~/.loadinme]
+loadinme stop [--data-dir ~/.loadinme]
 loadinme menu
 loadinme set-password [username]
 loadinme version
 loadinme --help
 ```
+
+`start` starts the web UI in the background and waits until it answers
+`/health` (it does nothing if the UI is already running); `stop` stops
+it. The menu no longer holds the database open while the UI runs — in
+v0.1.0 the menu's open database made the daemon fail to start with
+"could not open data store: timeout" while the menu still printed
+"Web UI started".
 
 Environment: `LOADINME_PORT`, `LOADINME_DATA`.
 
