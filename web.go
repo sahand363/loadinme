@@ -75,6 +75,7 @@ func newRouter(store *Store, cfg Config) http.Handler {
 	})
 	app.HandleFunc("/api/change-password", store.handleChangePassword)
 	app.HandleFunc("/f/", store.handleDownload)
+	app.HandleFunc("/p/", store.handlePreview)
 	mux.Handle("/", store.requireAuth(app))
 
 	return mux
