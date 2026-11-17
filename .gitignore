@@ -1,0 +1,7 @@
+loadinme
+loadinme-linux-amd64
+loadinme-linux-arm64
+loadinme-windows-amd64.exe
+*.db
+*.log
+*.pid
