@@ -23,7 +23,7 @@ import (
 	"strconv"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 func usage() {
 	fmt.Printf(`LoadInMe %s — file & text sharing for your VPS
@@ -93,12 +93,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, "loadinme: could not load config:", err)
 		os.Exit(1)
 	}
+	// Whether a config file already exists: an override must never
+	// clobber a saved port, but a first run with no config file yet
+	// still has to persist the port the UI actually runs on — later
+	// commands (menu, reset-password, restart) load the port from
+	// this file, and without it they would restart the UI on the
+	// 8080 default instead of the port it was running on.
+	_, statErr := os.Stat(configPath(dataDir))
+	configExists := statErr == nil
 	cfg.DataDir = dataDir
+	// A --port flag or LOADINME_PORT is a one-off override for this
+	// run only: it must never be written back over an existing
+	// saved config. The saved config is the source of truth for the
+	// port — v0.4.0 clobbered it, because serve saved the config
+	// after the override was applied, so an update that started the
+	// UI on the 8080 default permanently overwrote the user's
+	// saved 5234.
+	portOverridden := false
 	if *portFlag != 0 {
 		cfg.Port = *portFlag
+		portOverridden = true
 	} else if p := os.Getenv("LOADINME_PORT"); p != "" {
 		if n, err := strconv.Atoi(p); err == nil && n >= 1 && n <= 65535 {
 			cfg.Port = n
+			portOverridden = true
 		}
 	}
 	if cmd == "version" {
@@ -159,8 +177,16 @@ func main() {
 			os.Exit(1)
 		}
 		defer store.Close()
-		if err := saveConfig(cfg); err != nil {
-			fmt.Fprintln(os.Stderr, "loadinme: could not save config:", err)
+		// Persist the config — except when the port came from a
+		// one-off --port / LOADINME_PORT override AND a config file
+		// already exists: saving then would make the one-off port
+		// permanent and wipe the user's saved port (v0.5.0). With
+		// no config file yet, always save, so the port the UI runs
+		// on is recorded for later commands.
+		if !portOverridden || !configExists {
+			if err := saveConfig(cfg); err != nil {
+				fmt.Fprintln(os.Stderr, "loadinme: could not save config:", err)
+			}
 		}
 		has, _ := store.HasUser()
 		if !has {
