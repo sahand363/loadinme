@@ -40,6 +40,26 @@
     return '📄';
   }
 
+  function isImage(name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    return ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(ext);
+  }
+
+  // --- image lightbox ---
+  function openLightbox(id) {
+    const it = items.find((i) => i.id === id);
+    if (!it) return;
+    $('lightboxImg').src = '/p/' + encodeURIComponent(it.id);
+    $('lightboxImg').alt = it.name;
+    $('lightboxName').textContent = it.name;
+    $('lightboxDownload').href = '/f/' + encodeURIComponent(it.id);
+    $('lightboxModal').classList.add('open');
+  }
+  function closeLightbox() { $('lightboxModal').classList.remove('open'); $('lightboxImg').src = ''; }
+  $('lightboxClose').addEventListener('click', closeLightbox);
+  $('lightboxModal').addEventListener('click', (e) => { if (e.target === $('lightboxModal')) closeLightbox(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeLightbox(); });
+
   async function api(path, opts) {
     const res = await fetch(path, opts);
     if (res.status === 401) { location.href = '/login'; throw new Error('logged out'); }
@@ -62,7 +82,9 @@
     const clips = items.filter((i) => i.kind === 'clip');
     fileList.innerHTML = files.length ? files.map((it) => `
       <li class="file-row">
-        <span class="file-icon">${fileIcon(it.name)}</span>
+        ${isImage(it.name)
+          ? `<img class="file-thumb" src="/p/${esc(it.id)}" loading="lazy" alt="" data-preview="${esc(it.id)}">`
+          : `<span class="file-icon">${fileIcon(it.name)}</span>`}
         <div class="file-meta">
           <div class="file-name">${esc(it.name)}</div>
           <div class="file-sub">${fmtSize(it.size)} · ${fmtTime(it.createdAt)}
@@ -83,6 +105,8 @@
   }
 
   document.addEventListener('click', async (e) => {
+    const pv = e.target.closest('[data-preview]');
+    if (pv) { openLightbox(pv.dataset.preview); return; }
     const del = e.target.closest('[data-del]');
     if (del) {
       if (!confirm('Delete this item?')) return;
