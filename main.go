@@ -22,7 +22,7 @@ import (
 	"strconv"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func usage() {
 	fmt.Printf(`LoadInMe %s — file & text sharing for your VPS
