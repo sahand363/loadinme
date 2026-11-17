@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -455,4 +456,164 @@ func TestMenuStartWhileMenuOpen(t *testing.T) {
 	}
 	// The UI must still be running after the menu exits.
 	waitHealth(t, port, true)
+}
+
+// --- v0.3.0: image preview endpoint /p/{id} ---
+
+// tinyPNG is a valid 1x1 PNG.
+var tinyPNG = []byte{
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+	0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+	0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41,
+	0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+	0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+	0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+	0x42, 0x60, 0x82,
+}
+
+func testAuthedServer(t *testing.T, s *Store) (*httptest.Server, string) {
+	t.Helper()
+	hash, err := hashPassword("testpass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetUser("testuser", hash); err != nil {
+		t.Fatal(err)
+	}
+	token, err := s.CreateSession("testuser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(newRouter(s, Config{DataDir: s.DataDir()}))
+	t.Cleanup(srv.Close)
+	return srv, sessionCookie + "=" + token
+}
+
+func noRedirectClient() *http.Client {
+	return &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+}
+
+func uploadViaAPI(t *testing.T, srv *httptest.Server, cookie, filename string, data []byte) string {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	_ = mw.Close()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/upload", &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Cookie", cookie)
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("upload %s: status = %d, want 201; body: %s", filename, resp.StatusCode, b)
+	}
+	var out struct {
+		Item struct {
+			ID string `json:"id"`
+		} `json:"item"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Item.ID == "" {
+		t.Fatal("upload returned no item id")
+	}
+	return out.Item.ID
+}
+
+func getPreview(t *testing.T, srv *httptest.Server, cookie, id string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/p/"+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// 14a. A PNG preview returns 200, image/png, inline, with the exact bytes.
+func TestPreviewImagePNG(t *testing.T) {
+	s := testStore(t)
+	srv, cookie := testAuthedServer(t, s)
+	id := uploadViaAPI(t, srv, cookie, "tiny.png", tinyPNG)
+	resp := getPreview(t, srv, cookie, id)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("preview status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "image/png" {
+		t.Fatalf("Content-Type = %q, want image/png", ct)
+	}
+	if cd := resp.Header.Get("Content-Disposition"); cd != "inline" {
+		t.Fatalf("Content-Disposition = %q, want inline", cd)
+	}
+	if v := resp.Header.Get("X-Content-Type-Options"); v != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", v)
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, tinyPNG) {
+		t.Fatalf("preview body = %d bytes, want the %d uploaded PNG bytes", len(got), len(tinyPNG))
+	}
+}
+
+// 14b. Non-image previews are rejected: .txt and .svg both get 415
+// (SVG is not previewed — it can carry scripts).
+func TestPreviewNonImage415(t *testing.T) {
+	s := testStore(t)
+	srv, cookie := testAuthedServer(t, s)
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"notes.txt", []byte("hello")},
+		{"pic.svg", []byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`)},
+	} {
+		id := uploadViaAPI(t, srv, cookie, tc.name, tc.data)
+		resp := getPreview(t, srv, cookie, id)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnsupportedMediaType {
+			t.Fatalf("preview %s: status = %d, want 415", tc.name, resp.StatusCode)
+		}
+	}
+}
+
+// 14c. Unauthenticated preview redirects to /login (303), like /f/.
+func TestPreviewUnauthRedirect(t *testing.T) {
+	s := testStore(t)
+	srv, _ := testAuthedServer(t, s)
+	resp := getPreview(t, srv, "", "0123456789abcdef01234567")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("unauth preview status = %d, want 303", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/login" {
+		t.Fatalf("unauth preview Location = %q, want /login", loc)
+	}
 }
