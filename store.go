@@ -368,6 +368,17 @@ func (s *Store) DeleteSession(token string) error {
 	})
 }
 
+// ClearSessions deletes ALL login sessions, logging out every browser
+// and device. Called whenever the password is reset or changed, so
+// the new password is required everywhere (a reset must not leave
+// an already-logged-in browser logged in).
+func (s *Store) ClearSessions() error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(sessionBucket)
+		return b.ForEach(func(k, _ []byte) error { return b.Delete(k) })
+	})
+}
+
 // --- filename safety ---
 
 // sanitizeID keeps only [a-z0-9_-] (lowercase hex ids); anything else
