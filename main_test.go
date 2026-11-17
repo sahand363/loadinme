@@ -2,11 +2,17 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -237,4 +243,216 @@ func TestStoreRoundTrip(t *testing.T) {
 	if _, err := filepath.Abs(s.UploadsDir()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// --- v0.2.0: installer auto-start + menu no longer blocks the daemon ---
+
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func goTool(t *testing.T) string {
+	t.Helper()
+	if p, err := exec.LookPath("go"); err == nil {
+		return p
+	}
+	p := filepath.Join(os.Getenv("HOME"), "workspace", "go-tool", "go", "bin", "go")
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	t.Fatal("go toolchain not found (not in PATH, not in ~/workspace/go-tool/go/bin)")
+	return ""
+}
+
+// buildTestBinary compiles the real binary into a temp dir.
+func buildTestBinary(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "loadinme")
+	cmd := exec.Command(goTool(t), "build", "-o", bin, ".")
+	cmd.Dir = "."
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+func healthOK(t *testing.T, port int) bool {
+	t.Helper()
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+func waitHealth(t *testing.T, port int, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if healthOK(t, port) == want {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("health on port %d never became %v", port, want)
+}
+
+func runBin(t *testing.T, bin string, args ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command(bin, args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// 9. install.sh auto-starts the UI and opens the menu; no manual
+// "run loadinme menu, then press 1" steps any more.
+func TestInstallScriptAutoStart(t *testing.T) {
+	b, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		"/dev/tty", "LOADINME_NO_MENU", "LOADINME_NO_WEB",
+		"LOCAL_BINARY", "/health", "start --port", "setup page",
+	} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("install.sh is missing %q", want)
+		}
+	}
+	// The old manual flow must be gone: no "Next steps" block telling
+	// the user to run the menu and then start the UI by hand.
+	if strings.Contains(s, "Next steps:") {
+		t.Fatal("install.sh still has a manual 'Next steps' block")
+	}
+	if strings.Contains(s, "loadinme serve --port 8080") {
+		t.Fatal("install.sh still tells the user to start the UI by hand")
+	}
+	if out := exec.Command("bash", "-n", "install.sh").Run(); out != nil {
+		t.Fatalf("bash -n install.sh failed: %v", out)
+	}
+}
+
+// 10. /health probe: true for a live server, false when nothing listens.
+func TestProbeHealth(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+	_, portStr, _ := net.SplitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+	if !probeHealth(Config{Port: port}) {
+		t.Fatal("probeHealth = false for a live /health server")
+	}
+	if probeHealth(Config{Port: freePort(t)}) {
+		t.Fatal("probeHealth = true with nothing listening")
+	}
+}
+
+// 11. pidAlive: true for our own process, false for a dead one.
+func TestPidAlive(t *testing.T) {
+	if !pidAlive(os.Getpid()) {
+		t.Fatal("pidAlive(own pid) = false")
+	}
+	// A PID that (almost certainly) never existed.
+	if pidAlive(999999) {
+		t.Fatal("pidAlive(999999) = true")
+	}
+}
+
+// 12. `loadinme start` starts the UI (and /health answers), a second
+// start is a harmless no-op, `stop` stops it.
+func TestStartStopViaBinary(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	cfg := Config{Port: port, DataDir: dataDir}
+
+	out, err := runBin(t, bin, "start", "--port", strconv.Itoa(port), "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("start: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Web UI started") {
+		t.Fatalf("start output = %q, want 'Web UI started'", out)
+	}
+	waitHealth(t, port, true)
+	if !isServiceRunning(cfg) {
+		t.Fatal("isServiceRunning = false while the UI is up")
+	}
+
+	// Second start must not spawn a second copy.
+	out, err = runBin(t, bin, "start", "--port", strconv.Itoa(port), "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("second start: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "already running") {
+		t.Fatalf("second start output = %q, want 'already running'", out)
+	}
+	waitHealth(t, port, true)
+
+	out, err = runBin(t, bin, "stop", "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("stop: %v\n%s", err, out)
+	}
+	waitHealth(t, port, false)
+	if isServiceRunning(cfg) {
+		t.Fatal("isServiceRunning = true after stop")
+	}
+}
+
+// 13. Regression test for the v0.1.0 DB-lock bug: starting the UI from
+// the menu must work WHILE the menu is still open (the menu used to
+// hold the bbolt lock, so the daemon died with "could not open data
+// store: timeout" while the menu printed "Web UI started").
+func TestMenuStartWhileMenuOpen(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+
+	cmd := exec.Command(bin, "menu", "--port", strconv.Itoa(port), "--data-dir", dataDir)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stdout = &bytes.Buffer{}
+	cmd.Stderr = &bytes.Buffer{}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = runBin(t, bin, "stop", "--data-dir", dataDir)
+	}()
+	// Press 1 (Start), keep the menu alive by leaving stdin open.
+	if _, err := io.WriteString(stdin, "1\n"); err != nil {
+		t.Fatal(err)
+	}
+	// The UI must come up while the menu process is still running.
+	waitHealth(t, port, true)
+	if !isServiceRunning(Config{Port: port, DataDir: dataDir}) {
+		t.Fatal("isServiceRunning = false while menu-started UI is up")
+	}
+	// Exit the menu (Enter for the pause, then 0).
+	_, _ = io.WriteString(stdin, "\n0\n")
+	_ = stdin.Close()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("menu exited with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("menu did not exit")
+	}
+	// The UI must still be running after the menu exits.
+	waitHealth(t, port, true)
 }
