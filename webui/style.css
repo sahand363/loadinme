@@ -1,0 +1,77 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f7f7f5; color: #1f1f1f; }
+a { color: #0b57d0; }
+
+.topbar { display: flex; align-items: center; gap: 12px; background: #fff; border-bottom: 1px solid #e3e3e0; padding: 10px 18px; position: sticky; top: 0; z-index: 10; }
+.topbar h1 { font-size: 20px; margin: 0; }
+.topbar h1 span { color: #0b57d0; }
+.topbar .spacer { flex: 1; }
+.topbar .user { color: #666; font-size: 14px; }
+.icon-btn { background: #fff; border: 1px solid #ddd; border-radius: 8px; font-size: 18px; padding: 6px 10px; cursor: pointer; }
+.icon-btn:hover { background: #f0f0ee; }
+.logout { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 7px 12px; cursor: pointer; font-size: 14px; }
+.logout:hover { background: #f0f0ee; }
+
+.layout { display: flex; gap: 16px; padding: 16px 18px; align-items: flex-start; }
+.panel { background: #fff; border: 1px solid #e3e3e0; border-radius: 12px; padding: 14px; }
+.files-panel { flex: 1.6; min-width: 0; }
+.clips-panel { flex: 1; min-width: 280px; }
+.panel h2 { margin: 0 0 10px; font-size: 16px; }
+.panel .hint { color: #777; font-size: 13px; margin: -4px 0 12px; }
+
+.toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.btn { background: #0b57d0; color: #fff; border: none; border-radius: 8px; padding: 8px 14px; cursor: pointer; font-size: 14px; }
+.btn:hover { background: #0842a0; }
+.btn.secondary { background: #f0f0ee; color: #1f1f1f; border: 1px solid #ddd; }
+.btn.secondary:hover { background: #e4e4e1; }
+.btn.danger { background: #fff; color: #b3261e; border: 1px solid #f0c6c2; }
+.btn.danger:hover { background: #fce8e6; }
+.btn.small { padding: 4px 9px; font-size: 13px; }
+
+.dropzone { border: 2px dashed #c9c9c6; border-radius: 10px; padding: 18px; text-align: center; color: #777; margin-bottom: 12px; transition: all .15s; }
+.dropzone.over { border-color: #0b57d0; background: #eef4ff; color: #0b57d0; }
+
+.file-list { list-style: none; margin: 0; padding: 0; }
+.file-row { display: flex; align-items: center; gap: 10px; padding: 9px 6px; border-top: 1px solid #f0f0ee; }
+.file-row:hover { background: #fafafa; }
+.file-icon { font-size: 22px; width: 28px; text-align: center; }
+.file-meta { flex: 1; min-width: 0; }
+.file-name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-sub { color: #777; font-size: 12px; margin-top: 2px; }
+.file-sub .rel { color: #999; }
+.badge { display: inline-block; background: #eef4ff; color: #0b57d0; border-radius: 20px; padding: 1px 8px; font-size: 12px; margin-left: 6px; }
+.badge.forever { background: #e6f4ea; color: #137333; }
+.badge.soon { background: #fef7e0; color: #b06000; }
+.empty { color: #999; font-size: 14px; padding: 12px 4px; }
+
+.progress-wrap { margin: 6px 0; font-size: 13px; }
+.progress-wrap .bar { height: 8px; background: #eee; border-radius: 6px; overflow: hidden; margin-top: 4px; }
+.progress-wrap .bar i { display: block; height: 100%; background: #0b57d0; width: 0%; }
+
+.clip-form textarea { width: 100%; min-height: 80px; resize: vertical; border: 1px solid #ddd; border-radius: 8px; padding: 8px; font: inherit; font-size: 14px; }
+.clip-form .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.clip-form label { font-size: 14px; color: #555; }
+.clip { border-top: 1px solid #f0f0ee; padding: 10px 2px; }
+.clip-text { white-space: pre-wrap; word-break: break-word; font-size: 14px; background: #f7f7f5; border-radius: 8px; padding: 8px; max-height: 160px; overflow: auto; }
+.clip-meta { display: flex; align-items: center; gap: 6px; margin-top: 6px; color: #777; font-size: 12px; flex-wrap: wrap; }
+
+.modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 20; align-items: flex-start; justify-content: center; padding-top: 60px; }
+.modal.open { display: flex; }
+.modal-card { background: #fff; border-radius: 12px; padding: 20px; width: 420px; max-width: 92vw; }
+.modal-card h3 { margin: 0 0 12px; }
+.modal-card label { display: block; font-size: 14px; margin: 10px 0 4px; color: #555; }
+.modal-card input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 8px; font: inherit; }
+.modal-card .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+.modal-card .msg { font-size: 13px; color: #137333; margin-top: 8px; min-height: 16px; }
+.modal-card .msg.err { color: #b3261e; }
+.modal-card hr { border: none; border-top: 1px solid #eee; margin: 18px 0 6px; }
+
+.login-wrap { max-width: 380px; margin: 80px auto; background: #fff; border: 1px solid #e3e3e0; border-radius: 12px; padding: 28px; }
+.login-wrap h1 { margin: 0 0 4px; }
+.login-wrap p { color: #666; font-size: 14px; }
+.login-wrap label { display: block; font-size: 14px; margin: 12px 0 4px; color: #555; }
+.login-wrap input { width: 100%; padding: 9px; border: 1px solid #ddd; border-radius: 8px; font: inherit; }
+.login-wrap .btn { width: 100%; margin-top: 18px; }
+.login-wrap .error { color: #b3261e; font-size: 14px; margin-top: 10px; }
+
+@media (max-width: 900px) { .layout { flex-direction: column; } .clips-panel { width: 100%; } }
