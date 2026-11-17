@@ -10,6 +10,7 @@
 //	loadinme serve [--port 8080] [--data-dir ~/.loadinme]
 //	loadinme menu            # SSH menu (web link on top)
 //	loadinme set-password [username]
+//	loadinme reset-password [username]   # alias of set-password
 //	loadinme version
 //	loadinme --help
 package main
@@ -22,7 +23,7 @@ import (
 	"strconv"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func usage() {
 	fmt.Printf(`LoadInMe %s — file & text sharing for your VPS
@@ -33,6 +34,9 @@ Usage:
   loadinme stop [--data-dir DIR]
   loadinme menu
   loadinme set-password [username]
+  loadinme reset-password [username]   # same as set-password: resets
+         # the login without asking for the old password, and logs
+         # out every browser/device
   loadinme version
   loadinme --help
 
@@ -68,7 +72,7 @@ func main() {
 	args := os.Args[1:]
 	if len(args) > 0 {
 		switch args[0] {
-		case "serve", "start", "stop", "menu", "set-password", "version":
+		case "serve", "start", "stop", "menu", "set-password", "reset-password", "version":
 			cmd = args[0]
 			args = args[1:]
 		}
@@ -111,18 +115,22 @@ func main() {
 	openStore := func() (*Store, error) { return OpenStore(dataDir) }
 
 	switch cmd {
-	case "set-password":
-		store, err := openStore()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "loadinme: could not open data store:", err)
-			os.Exit(1)
-		}
-		defer store.Close()
+	case "set-password", "reset-password":
 		username := ""
 		if fs.NArg() > 0 {
 			username = fs.Arg(0)
 		}
-		if err := setPasswordCLI(store, username); err != nil {
+		// Same lock problem as the menu: if the web UI is running,
+		// stop it first, change the password, then restart it.
+		err := withServiceStopped(cfg, func() error {
+			store, err := openStore()
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			return setPasswordCLI(store, username, nil)
+		})
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "loadinme:", err)
 			os.Exit(1)
 		}
