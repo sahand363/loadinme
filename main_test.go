@@ -961,3 +961,215 @@ func TestMenuResetPasswordWhileRunning(t *testing.T) {
 		t.Fatal("new password does not log in after menu reset")
 	}
 }
+
+// v0.5.0: a --port flag or LOADINME_PORT env override is one-off and
+// must never be written back to config.json. v0.4.0 clobbered it:
+// serve saved the config after the override was applied, so an
+// update that started the UI on the 8080 default permanently
+// overwrote the user's saved port 5234. Regression test: the saved
+// port stays 5234 through a flag override, an env override, and a
+// plain start that must keep serving on the saved port.
+func TestPortOverrideDoesNotClobberSavedPort(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	const savedPort = 5234
+
+	savedPortInConfig := func() int {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
+		if err != nil {
+			t.Fatalf("read config.json: %v", err)
+		}
+		var cfg Config
+		if err := json.Unmarshal(b, &cfg); err != nil {
+			t.Fatalf("parse config.json: %v", err)
+		}
+		return cfg.Port
+	}
+	stop := func() {
+		t.Helper()
+		if out, err := runBin(t, bin, "stop", "--data-dir", dataDir); err != nil {
+			t.Fatalf("stop: %v\n%s", err, out)
+		}
+	}
+
+	// Save port 5234 the way the menu does (option 5).
+	if err := saveConfig(Config{Port: savedPort, DataDir: dataDir}); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	// 1. --port override: the UI serves on the override port, but
+	// config.json must still say 5234 afterwards.
+	override := freePort(t)
+	if override == savedPort {
+		override = freePort(t)
+	}
+	out, err := runBin(t, bin, "start", "--port", strconv.Itoa(override), "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("start with --port override: %v\n%s", err, out)
+	}
+	waitHealth(t, override, true)
+	if got := savedPortInConfig(); got != savedPort {
+		t.Fatalf("config port after --port %d start = %d, want %d (override clobbered the saved port)", override, got, savedPort)
+	}
+	stop()
+	waitHealth(t, override, false)
+
+	// 2. LOADINME_PORT override: same — serves on the env port,
+	// saved port stays 5234.
+	t.Setenv("LOADINME_PORT", strconv.Itoa(override))
+	out, err = runBin(t, bin, "start", "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("start with LOADINME_PORT override: %v\n%s", err, out)
+	}
+	waitHealth(t, override, true)
+	if got := savedPortInConfig(); got != savedPort {
+		t.Fatalf("config port after LOADINME_PORT=%d start = %d, want %d (override clobbered the saved port)", override, got, savedPort)
+	}
+	stop()
+	waitHealth(t, override, false)
+
+	// 3. No override: the UI must serve on the saved port 5234, and
+	// the config must still say 5234.
+	t.Setenv("LOADINME_PORT", "")
+	out, err = runBin(t, bin, "start", "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("start without override: %v\n%s", err, out)
+	}
+	waitHealth(t, savedPort, true)
+	if got := savedPortInConfig(); got != savedPort {
+		t.Fatalf("config port after plain start = %d, want %d", got, savedPort)
+	}
+	stop()
+	waitHealth(t, savedPort, false)
+}
+
+// v0.5.0: install.sh must read the saved port from config.json even
+// when python3 is missing (v0.4.0 used python3 only, so the parse
+// silently failed and the update started the UI on 8080). This runs
+// the actual saved_port() function from install.sh — extracted
+// verbatim, not a copy — with python3 hidden from PATH.
+// v0.5.0: install.sh must read the saved port from config.json even
+// when python3 is missing (v0.4.0 used python3 only, so the parse
+// silently failed and the update started the UI on 8080). This runs
+// the actual saved_port() function from install.sh — extracted
+// verbatim, not a copy — with python3 hidden from PATH.
+func TestInstallScriptSavedPortWithoutPython3(t *testing.T) {
+	b, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	if !strings.Contains(s, "saved_port()") {
+		t.Fatal("install.sh is missing the saved_port() function")
+	}
+	if strings.Contains(s, `python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('port') or 8080)"`) {
+		t.Fatal("install.sh still uses the python3-only port parse that falls back to 8080")
+	}
+	// Extract saved_port() verbatim from install.sh (up to its
+	// closing brace on its own line) and run it.
+	lines := strings.Split(s, "\n")
+	start := -1
+	for i, ln := range lines {
+		if strings.HasPrefix(ln, "saved_port() {") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatal("could not find saved_port() in install.sh")
+	}
+	end := -1
+	for i := start + 1; i < len(lines); i++ {
+		if lines[i] == "}" {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		t.Fatal("could not find the end of saved_port() in install.sh")
+	}
+	fn := strings.Join(lines[start:end+1], "\n")
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte("{\n  \"port\": 5234,\n  \"dataDir\": \""+dir+"\"\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run saved_port with a minimal PATH that has bash/grep/head
+	// but NO python3, so only the grep fallback can work.
+	toolDir := t.TempDir()
+	for _, tool := range []string{"bash", "grep", "head"} {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatalf("LookPath %s: %v", tool, err)
+		}
+		if err := os.Symlink(p, filepath.Join(toolDir, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runSavedPort := func(pathEnv, cfg string) string {
+		t.Helper()
+		script := fn + "\nsaved_port \"$1\"\n"
+		cmd := exec.Command(toolDir+"/bash", "-c", script, "test", cfg)
+		cmd.Env = []string{"PATH=" + pathEnv}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("saved_port run failed (PATH=%s): %v\n%s", pathEnv, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	if got := runSavedPort(toolDir, cfgPath); got != "5234" {
+		t.Fatalf("saved_port without python3 = %q, want 5234", got)
+	}
+	// With the normal PATH (python3 present) it must also say 5234.
+	if got := runSavedPort(os.Getenv("PATH"), cfgPath); got != "5234" {
+		t.Fatalf("saved_port with python3 = %q, want 5234", got)
+	}
+	// Missing file: 8080, and only then.
+	if got := runSavedPort(toolDir, filepath.Join(dir, "nope.json")); got != "8080" {
+		t.Fatalf("saved_port missing file = %q, want 8080", got)
+	}
+	// Config with no port key: 8080.
+	noPortPath := filepath.Join(dir, "noport.json")
+	if err := os.WriteFile(noPortPath, []byte("{\n  \"dataDir\": \""+dir+"\"\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := runSavedPort(toolDir, noPortPath); got != "8080" {
+		t.Fatalf("saved_port no-port config = %q, want 8080", got)
+	}
+}
+
+// v0.5.0 companion to TestPortOverrideDoesNotClobberSavedPort: on a
+// FRESH data dir (no config.json yet) a --port override IS persisted,
+// because later commands (menu, reset-password, restart) load the
+// port from config.json — without it they would restart the UI on
+// the 8080 default instead of the port it was running on. (This is
+// what TestResetPasswordWhileServerRunning relies on.)
+func TestFirstRunPersistsOverridePort(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+
+	out, err := runBin(t, bin, "start", "--port", strconv.Itoa(port), "--data-dir", dataDir)
+	if err != nil {
+		t.Fatalf("start: %v\n%s", err, out)
+	}
+	waitHealth(t, port, true)
+	defer func() {
+		_, _ = runBin(t, bin, "stop", "--data-dir", dataDir)
+	}()
+	b, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
+	if err != nil {
+		t.Fatalf("config.json was not created on first run: %v", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("parse config.json: %v", err)
+	}
+	if cfg.Port != port {
+		t.Fatalf("first-run config port = %d, want %d", cfg.Port, port)
+	}
+}
