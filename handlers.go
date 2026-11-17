@@ -411,6 +411,9 @@ func (s *Store) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Log out every browser/device, including this one: the new
+	// password is required everywhere from now on.
+	_ = s.ClearSessions()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
