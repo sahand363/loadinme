@@ -17,7 +17,8 @@
 
 <main class="layout">
   <section class="panel files-panel" id="filesPanel">
-    <h2>📁 Files</h2>
+    <div class="panel-head files-head"><h2>📁 Files</h2></div>
+    <div class="panel-body">
     <p class="hint">Drag files or a folder here, or use the buttons. Files expire after 24 hours unless kept forever.</p>
     <div class="toolbar">
       <button class="btn" id="uploadFilesBtn">Upload files</button>
@@ -28,10 +29,12 @@
     <div class="dropzone" id="dropzone">Drop files or folders here to upload</div>
     <div id="progressArea"></div>
     <ul class="file-list" id="fileList"></ul>
+    </div>
   </section>
 
   <section class="panel clips-panel">
-    <h2>📋 Clipboard</h2>
+    <div class="panel-head clips-head"><h2>📋 Clipboard</h2></div>
+    <div class="panel-body">
     <p class="hint">Press Ctrl+V anywhere on this page to save a clip.</p>
     <div class="clip-form">
       <textarea id="clipText" placeholder="Paste or type text here…"></textarea>
@@ -42,8 +45,22 @@
       </div>
     </div>
     <div id="clipList"></div>
+    </div>
   </section>
 </main>
+
+<div class="modal lightbox" id="lightboxModal">
+  <div class="lightbox-card">
+    <img id="lightboxImg" src="" alt="">
+    <div class="lightbox-meta">
+      <span id="lightboxName"></span>
+      <div class="row">
+        <a class="btn small" id="lightboxDownload" href="#">Download</a>
+        <button class="btn small secondary" id="lightboxClose">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div class="modal" id="settingsModal">
   <div class="modal-card">
