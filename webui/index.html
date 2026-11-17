@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoadInMe</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>⬆ Load<span>InMe</span></h1>
+  <div class="spacer"></div>
+  <span class="user" id="userLabel"></span>
+  <button class="icon-btn" id="settingsBtn" title="Settings">⚙️</button>
+  <button class="logout" id="logoutBtn">Log out</button>
+</header>
+
+<main class="layout">
+  <section class="panel files-panel" id="filesPanel">
+    <h2>📁 Files</h2>
+    <p class="hint">Drag files or a folder here, or use the buttons. Files expire after 24 hours unless kept forever.</p>
+    <div class="toolbar">
+      <button class="btn" id="uploadFilesBtn">Upload files</button>
+      <button class="btn secondary" id="uploadFolderBtn">Upload folder</button>
+      <input type="file" id="fileInput" multiple hidden>
+      <input type="file" id="folderInput" webkitdirectory hidden>
+    </div>
+    <div class="dropzone" id="dropzone">Drop files or folders here to upload</div>
+    <div id="progressArea"></div>
+    <ul class="file-list" id="fileList"></ul>
+  </section>
+
+  <section class="panel clips-panel">
+    <h2>📋 Clipboard</h2>
+    <p class="hint">Press Ctrl+V anywhere on this page to save a clip.</p>
+    <div class="clip-form">
+      <textarea id="clipText" placeholder="Paste or type text here…"></textarea>
+      <div class="row">
+        <label><input type="checkbox" id="clipKeepForever"> Keep forever</label>
+        <div class="spacer" style="flex:1"></div>
+        <button class="btn" id="addClipBtn">Add clip</button>
+      </div>
+    </div>
+    <div id="clipList"></div>
+  </section>
+</main>
+
+<div class="modal" id="settingsModal">
+  <div class="modal-card">
+    <h3>⚙️ Settings</h3>
+    <label>Max items in total (files + clips)</label>
+    <input type="number" id="setMaxItems" min="1" max="10000">
+    <label>Max file size (MB)</label>
+    <input type="number" id="setMaxFileMB" min="1" max="1024">
+    <label>Default expiry (hours)</label>
+    <input type="number" id="setExpiry" min="1" max="720">
+    <div class="row">
+      <button class="btn secondary" id="settingsClose">Close</button>
+      <button class="btn" id="settingsSave">Save settings</button>
+    </div>
+    <div class="msg" id="settingsMsg"></div>
+    <hr>
+    <h3>Change password</h3>
+    <label>Current password</label>
+    <input type="password" id="pwCurrent" autocomplete="current-password">
+    <label>New password</label>
+    <input type="password" id="pwNew" autocomplete="new-password">
+    <div class="row">
+      <button class="btn" id="pwSave">Change password</button>
+    </div>
+    <div class="msg" id="pwMsg"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
