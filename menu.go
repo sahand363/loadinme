@@ -198,12 +198,57 @@ func waitHealthy(cfg Config) bool {
 // pidAlive reports whether a process with this PID exists (signal 0).
 // The old code used p.Signal(os.Signal(nil)), which always errors, so
 // the menu never reported the nohup process as running.
+// A zombie still answers signal 0 but is already dead, so on Linux a
+// process in state Z (see /proc/<pid>/stat) counts as not alive —
+// otherwise a lingering zombie would look like a live web UI and a
+// stop-wait would time out for a process that is already gone.
 func pidAlive(pid int) bool {
 	p, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
-	return p.Signal(syscall.Signal(0)) == nil
+	if p.Signal(syscall.Signal(0)) != nil {
+		return false
+	}
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+		if i := strings.LastIndex(string(b), ") "); i >= 0 && len(string(b)) > i+2 {
+			return string(b)[i+2] != 'Z'
+		}
+	}
+	return true
+}
+
+// waitStopped waits up to 5s for the process to die AND the port to go
+// quiet. A stop that returns while the old process still holds the
+// port (or the database lock) makes the next start fail — either it
+// sees /health still answering and returns errAlreadyRunning, or the
+// new daemon cannot bind / open the DB and exits.
+func waitStopped(cfg Config, pid int) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if !pidAlive(pid) && !probeHealth(cfg) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("web UI did not stop within 5s: process %d still alive or port %d still answering /health", pid, cfg.Port)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// waitServiceStopped is the same wait for the systemd path, where
+// there is no PID to watch — it polls isServiceRunning instead.
+func waitServiceStopped(cfg Config) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if !isServiceRunning(cfg) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("web UI did not stop within 5s: port %d still answering /health", cfg.Port)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func pidFromFile(cfg Config) (int, bool) {
@@ -275,6 +320,12 @@ func startServiceExe(cfg Config, exe string) error {
 		return err
 	}
 	if !waitHealthy(cfg) {
+		// The child never came up (port still held, DB lock, …) —
+		// kill it and drop the PID file so a half-started process
+		// cannot linger holding the port / database lock.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		_ = os.Remove(pidFile(cfg))
 		return fmt.Errorf("web UI did not start on port %d (is the port already in use?) — check the log: %s", cfg.Port, logPath)
 	}
 	return nil
@@ -284,7 +335,12 @@ func stopService(cfg Config) error {
 	if hasSystemdUser() {
 		cmd := exec.Command("systemctl", "--user", "stop", "loadinme.service")
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-		return cmd.Run()
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+		// systemctl stop can return while the process still lingers;
+		// wait until it is actually gone before reporting stopped.
+		return waitServiceStopped(cfg)
 	}
 	b, err := os.ReadFile(pidFile(cfg))
 	if err != nil {
@@ -301,6 +357,11 @@ func stopService(cfg Config) error {
 	_ = p.Signal(os.Interrupt)
 	time.Sleep(500 * time.Millisecond)
 	_ = p.Kill()
+	// Wait until the process is actually dead and the port is free
+	// before returning — only then remove the PID file.
+	if err := waitStopped(cfg, pid); err != nil {
+		return err
+	}
 	_ = os.Remove(pidFile(cfg))
 	return nil
 }
@@ -326,6 +387,29 @@ func restartService(cfg Config) error {
 	return startService(cfg)
 }
 
+// restartFailedError is returned by withServiceStopped when the web UI
+// could not be restarted after fn ran. fnErr is the error fn returned
+// (nil when the password change itself succeeded), so the caller can
+// tell the user the reset worked but the UI is down — instead of
+// swallowing the restart failure in a WARNING and exiting 0 while
+// the server is actually down (CI run #23: the menu exited fine, but
+// /health never came back and the test could only say so).
+type restartFailedError struct {
+	fnErr error
+	err   error
+}
+
+func (e *restartFailedError) Error() string {
+	if e.fnErr != nil {
+		return fmt.Sprintf("password change failed (%v) and the web UI could not be restarted: %v", e.fnErr, e.err)
+	}
+	return fmt.Sprintf("password change may have succeeded, but the web UI could not be restarted: %v", e.err)
+}
+
+// Unwrap returns fn's error so errors.Is(err, errCancelled) still
+// works when the user cancelled the password prompt.
+func (e *restartFailedError) Unwrap() error { return e.fnErr }
+
 // withServiceStopped stops the web UI if it is running, runs fn, then
 // restarts the UI if it was running. This is REQUIRED for any
 // operation that opens the database from another process (e.g.
@@ -333,22 +417,24 @@ func restartService(cfg Config) error {
 // daemon holds the database open, no other process can open it at all
 // — a plain open just fails with "could not open data store: timeout".
 // The UI is restarted even if fn fails or is cancelled, so a reset
-// never leaves the server down.
+// never leaves the server down. If the restart fails, that error is
+// RETURNED (not swallowed) — the caller must surface it, because the
+// server is down at that point.
 func withServiceStopped(cfg Config, fn func() error) error {
 	wasRunning := isServiceRunning(cfg)
-	if wasRunning {
-		fmt.Println("Stopping the web UI first — it holds the database open…")
-		if err := stopService(cfg); err != nil {
-			return fmt.Errorf("could not stop the web UI (%v) — stop it first (loadinme stop), then try again", err)
-		}
-		defer func() {
-			fmt.Println("Restarting the web UI…")
-			if err := startService(cfg); err != nil {
-				fmt.Printf("WARNING: the web UI could not be restarted: %v — start it with option 1.\n", err)
-			}
-		}()
+	if !wasRunning {
+		return fn()
 	}
-	return fn()
+	fmt.Println("Stopping the web UI first — it holds the database open…")
+	if err := stopService(cfg); err != nil {
+		return fmt.Errorf("could not stop the web UI (%v) — stop it first (loadinme stop), then try again", err)
+	}
+	fnErr := fn()
+	fmt.Println("Restarting the web UI…")
+	if err := startService(cfg); err != nil {
+		return &restartFailedError{fnErr: fnErr, err: err}
+	}
+	return fnErr
 }
 
 // findCerts looks for a Let's Encrypt certificate for a domain.
@@ -724,7 +810,16 @@ func runMenu(cfg *Config) {
 				})
 			})
 			if err != nil {
-				if errors.Is(err, errCancelled) {
+				var rerr *restartFailedError
+				if errors.As(err, &rerr) {
+					if rerr.fnErr == nil {
+						fmt.Printf("Password was reset, but the web UI could not be restarted: %v — start it with option 1.\n", rerr.err)
+					} else if errors.Is(rerr.fnErr, errCancelled) {
+						fmt.Printf("Cancelled, but the web UI could not be restarted: %v — start it with option 1.\n", rerr.err)
+					} else {
+						fmt.Printf("Could not change password: %v — and the web UI could not be restarted: %v — start it with option 1.\n", rerr.fnErr, rerr.err)
+					}
+				} else if errors.Is(err, errCancelled) {
 					fmt.Println("Cancelled.")
 				} else {
 					fmt.Println("Could not change password:", err)
