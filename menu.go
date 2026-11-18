@@ -29,7 +29,8 @@ import (
 //
 // Menu:
 //   1 Start   2 Stop   3 Restart   4 Status   5 Change port
-//   6 Domain & SSL (1 Get SSL, 2 List & revoke)   7 Update
+//   6 Domain & SSL (1 Get SSL, 2 List & revoke, 3 Clear saved domain)
+//   7 Update
 //   8 Reset / change username & password   9 View settings
 //   10 Show web UI link   11 Uninstall   0 Exit (silent, no farewell)
 
@@ -457,22 +458,45 @@ func withServiceStopped(cfg Config, fn func() error) error {
 // the real /etc/letsencrypt is root-owned and may not exist here.
 var letsEncryptDir = "/etc/letsencrypt"
 
-// findCerts looks for a Let's Encrypt certificate for a domain.
+// findCerts looks for a Let's Encrypt certificate for a domain: first
+// a lineage folder named after the domain, then any certificate whose
+// covered domains include it. A lineage name can differ from the
+// domain it covers (a multi-domain cert, or a lineage named
+// example.com-0001), so matching by folder name alone would miss it.
 func findCerts(domain string) (cert, key string, ok bool) {
 	cert = filepath.Join(letsEncryptDir, "live", domain, "fullchain.pem")
 	key = filepath.Join(letsEncryptDir, "live", domain, "privkey.pem")
-	if _, err := os.Stat(cert); err != nil {
-		return "", "", false
+	if _, err := os.Stat(cert); err == nil {
+		if _, err := os.Stat(key); err == nil {
+			return cert, key, true
+		}
 	}
-	if _, err := os.Stat(key); err != nil {
-		return "", "", false
+	for _, c := range findCertsByDomain(domain) {
+		return c.certPath(), c.keyPath(), true
 	}
-	return cert, key, true
+	return "", "", false
+}
+
+// findCertsByDomain returns every lineage whose certificate covers
+// domain (case-insensitive), in display order.
+func findCertsByDomain(domain string) []certInfo {
+	certs, err := listCerts()
+	if err != nil {
+		return nil
+	}
+	var out []certInfo
+	for _, c := range certs {
+		if c.covers(domain) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // domainSSLMenu is the "Domain & SSL" submenu (menu option 6):
 // 1 gets an SSL certificate, 2 lists certificates and revokes one,
-// 0 goes back to the main menu (never exits the app).
+// 3 clears the saved domain, 0 goes back to the main menu (never
+// exits the app).
 func domainSSLMenu(cfg *Config, scanner *bufio.Scanner) {
 	for {
 		fmt.Println("  Domain & SSL")
@@ -487,9 +511,10 @@ func domainSSLMenu(cfg *Config, scanner *bufio.Scanner) {
 		}
 		fmt.Println("  1  Get SSL (enter domain, then email)")
 		fmt.Println("  2  List certificates & revoke one")
+		fmt.Println("  3  Clear saved domain")
 		fmt.Println("  0  Back to main menu")
 		fmt.Println()
-		fmt.Print("  Choose [0-2]: ")
+		fmt.Print("  Choose [0-3]: ")
 		if !scanner.Scan() {
 			return
 		}
@@ -500,10 +525,12 @@ func domainSSLMenu(cfg *Config, scanner *bufio.Scanner) {
 			getSSLCert(cfg, scanner)
 		case "2":
 			listAndRevokeCerts(cfg, scanner)
+		case "3":
+			clearSavedDomain(cfg)
 		case "0":
 			return
 		default:
-			fmt.Println("Please choose 0-2.")
+			fmt.Println("Please choose 0-3.")
 		}
 	}
 }
@@ -525,17 +552,33 @@ func getSSLCert(cfg *Config, scanner *bufio.Scanner) {
 	}
 	cfg.Domain = domain
 	_ = saveConfig(*cfg)
-	if cert, key, ok := findCerts(domain); ok {
-		fmt.Println("Certificate already found:")
-		fmt.Println("  ", cert)
-		fmt.Println("  ", key)
+	// Match by the domains a certificate covers, not by folder name:
+	// the domain may already have a certificate under a different
+	// lineage name, and running certbot for it again would ask
+	// whether to change that certificate's key type.
+	matches := findCertsByDomain(domain)
+	if len(matches) > 0 {
+		var chosen certInfo
+		if len(matches) == 1 {
+			chosen = matches[0]
+			fmt.Println("Certificate already found:")
+			fmt.Println("  ", chosen.certPath())
+			fmt.Println("  ", chosen.keyPath())
+		} else {
+			fmt.Println("More than one certificate covers", domain+":")
+			var ok bool
+			chosen, ok = pickCert(scanner, matches, *cfg)
+			if !ok {
+				return
+			}
+		}
 		ans, cancelled := promptCancel(scanner, "Enable HTTPS with this certificate? (y/n)", "y")
 		if cancelled {
 			fmt.Println("Cancelled.")
 			return
 		}
 		if strings.ToLower(ans) == "y" || strings.ToLower(ans) == "yes" {
-			enableSSL(cfg, cert, key)
+			enableSSL(cfg, chosen.certPath(), chosen.keyPath())
 		}
 		return
 	}
@@ -544,7 +587,7 @@ func getSSLCert(cfg *Config, scanner *bufio.Scanner) {
 	if _, err := exec.LookPath("certbot"); err != nil {
 		fmt.Println("certbot is not installed. Run these commands on the server:")
 		fmt.Println("  sudo apt update && sudo apt install -y certbot")
-		fmt.Println("  sudo certbot certonly --standalone -d " + domain)
+		fmt.Println("  sudo certbot certonly --standalone -d " + domain + " --cert-name " + domain)
 		fmt.Println("Then come back here — I will find the certificate and turn SSL on.")
 		return
 	}
@@ -564,8 +607,10 @@ func getSSLCert(cfg *Config, scanner *bufio.Scanner) {
 		_ = stopService(*cfg)
 	}
 	fmt.Println("Running certbot — this may ask for sudo…")
+	// --cert-name names the new lineage after the domain, so future
+	// lookups by domain find it by folder name too.
 	cmd := exec.Command("sudo", "certbot", "certonly", "--standalone", "-d", domain,
-		"--agree-tos", "--non-interactive", "--email", email)
+		"--cert-name", domain, "--agree-tos", "--non-interactive", "--email", email)
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 	if err := cmd.Run(); err != nil {
 		fmt.Println("certbot failed:", err)
@@ -619,15 +664,93 @@ func restartAfterSSL(cfg *Config) {
 }
 
 // certInfo is one certificate found under <letsEncryptDir>/live/.
+// lineage is the folder name (certbot's name for the certificate);
+// domains are the names the certificate actually covers, read from
+// the certificate itself. The two can differ (a multi-domain cert,
+// or a lineage named example.com-0001), so matching is always by
+// domain, never by folder name alone.
 type certInfo struct {
-	domain    string
+	lineage   string
+	domains   []string
 	expiry    time.Time
 	hasExpiry bool
 }
 
+// certPath is the certificate file for this lineage.
+func (c certInfo) certPath() string {
+	return filepath.Join(letsEncryptDir, "live", c.lineage, "fullchain.pem")
+}
+
+// keyPath is the private key file for this lineage.
+func (c certInfo) keyPath() string {
+	return filepath.Join(letsEncryptDir, "live", c.lineage, "privkey.pem")
+}
+
+// primaryDomain is the first domain the certificate covers, or the
+// lineage name when the certificate could not be parsed.
+func (c certInfo) primaryDomain() string {
+	if len(c.domains) > 0 {
+		return c.domains[0]
+	}
+	return c.lineage
+}
+
+// covers reports whether the certificate covers domain
+// (case-insensitive).
+func (c certInfo) covers(domain string) bool {
+	for _, d := range c.domains {
+		if strings.EqualFold(d, domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// describeCert is one line for the certificate list: the domains it
+// covers, its expiry date, and whether it is the one in use.
+func describeCert(c certInfo, cfg Config) string {
+	name := c.primaryDomain()
+	if len(c.domains) > 1 {
+		name += " (also covers: " + strings.Join(c.domains[1:], ", ") + ")"
+	}
+	if c.lineage != c.primaryDomain() {
+		name += " [certificate " + c.lineage + "]"
+	}
+	expiry := "expiry unknown"
+	if c.hasExpiry {
+		expiry = "expires " + c.expiry.Format("2006-01-02")
+	}
+	inUse := ""
+	if cfg.TLSEnabled && c.covers(cfg.Domain) {
+		inUse = "  (in use)"
+	}
+	return fmt.Sprintf("  %s — %s%s", name, expiry, inUse)
+}
+
+// pickCert asks the user to choose one of several certificates by
+// number. It returns false when the user cancels with 0.
+func pickCert(scanner *bufio.Scanner, certs []certInfo, cfg Config) (certInfo, bool) {
+	for i, c := range certs {
+		fmt.Printf("  %d  %s\n", i+1, describeCert(c, cfg))
+	}
+	ans, cancelled := promptCancel(scanner, "Which one", "")
+	if cancelled {
+		fmt.Println("Cancelled.")
+		return certInfo{}, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(ans))
+	if err != nil || n < 1 || n > len(certs) {
+		fmt.Println("That is not one of the certificates. Nothing changed.")
+		return certInfo{}, false
+	}
+	return certs[n-1], true
+}
+
 // listCerts returns every certificate under <letsEncryptDir>/live/.
-// Each subdirectory is one certificate; the expiry is read from the
-// certificate itself (crypto/x509, no openssl needed).
+// Each subdirectory is one certificate; the covered domains and the
+// expiry are read from the certificate itself (crypto/x509, no
+// openssl needed). A certificate that cannot be parsed is still
+// listed by its folder name, with no domains and unknown expiry.
 func listCerts() ([]certInfo, error) {
 	liveDir := filepath.Join(letsEncryptDir, "live")
 	entries, err := os.ReadDir(liveDir)
@@ -639,23 +762,35 @@ func listCerts() ([]certInfo, error) {
 		if !e.IsDir() {
 			continue
 		}
-		info := certInfo{domain: e.Name()}
+		info := certInfo{lineage: e.Name()}
 		if b, err := os.ReadFile(filepath.Join(liveDir, e.Name(), "fullchain.pem")); err == nil {
 			if block, _ := pem.Decode(b); block != nil {
 				if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
 					info.expiry = cert.NotAfter
 					info.hasExpiry = true
+					info.domains = cert.DNSNames
+					if len(info.domains) == 0 && cert.Subject.CommonName != "" {
+						info.domains = []string{cert.Subject.CommonName}
+					}
 				}
 			}
 		}
 		out = append(out, info)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].domain < out[j].domain })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].primaryDomain() != out[j].primaryDomain() {
+			return out[i].primaryDomain() < out[j].primaryDomain()
+		}
+		return out[i].lineage < out[j].lineage
+	})
 	return out, nil
 }
 
 // listAndRevokeCerts is submenu 2: show every Let's Encrypt
-// certificate with its expiry date, and revoke one by domain.
+// certificate with its expiry date, and revoke one by domain. A
+// certificate is found by the domains it covers, not by its folder
+// name, so one stored under another name still shows up and can be
+// revoked by typing the domain it covers.
 func listAndRevokeCerts(cfg *Config, scanner *bufio.Scanner) {
 	liveDir := filepath.Join(letsEncryptDir, "live")
 	certs, err := listCerts()
@@ -674,15 +809,7 @@ func listAndRevokeCerts(cfg *Config, scanner *bufio.Scanner) {
 	}
 	fmt.Println("Certificates in", liveDir+":")
 	for _, c := range certs {
-		expiry := "expiry unknown"
-		if c.hasExpiry {
-			expiry = "expires " + c.expiry.Format("2006-01-02")
-		}
-		inUse := ""
-		if c.domain == cfg.Domain && cfg.TLSEnabled {
-			inUse = "  (in use)"
-		}
-		fmt.Printf("  %s — %s%s\n", c.domain, expiry, inUse)
+		fmt.Println(describeCert(c, *cfg))
 	}
 	domain, cancelled := promptCancel(scanner, "Domain to revoke", "")
 	if cancelled {
@@ -694,18 +821,23 @@ func listAndRevokeCerts(cfg *Config, scanner *bufio.Scanner) {
 		fmt.Println("No domain given. Nothing revoked.")
 		return
 	}
-	found := false
-	for _, c := range certs {
-		if c.domain == domain {
-			found = true
-			break
-		}
-	}
-	if !found {
-		fmt.Println("No certificate found for", domain+". Nothing revoked.")
+	matches := findCertsByDomain(domain)
+	if len(matches) == 0 {
+		fmt.Println("No certificate covers", domain+". Nothing revoked.")
 		return
 	}
-	ans, cancelled := promptCancel(scanner, "Revoke the certificate for "+domain+"? This cannot be undone (y/n)", "n")
+	var chosen certInfo
+	if len(matches) == 1 {
+		chosen = matches[0]
+	} else {
+		fmt.Println("More than one certificate covers", domain+":")
+		var ok bool
+		chosen, ok = pickCert(scanner, matches, *cfg)
+		if !ok {
+			return
+		}
+	}
+	ans, cancelled := promptCancel(scanner, "Revoke the certificate for "+chosen.primaryDomain()+"? This cannot be undone (y/n)", "n")
 	if cancelled {
 		fmt.Println("Cancelled.")
 		return
@@ -714,18 +846,51 @@ func listAndRevokeCerts(cfg *Config, scanner *bufio.Scanner) {
 		fmt.Println("Not revoked.")
 		return
 	}
-	revokeCert(cfg, domain)
+	revokeCert(cfg, chosen)
 }
 
-// revokeCert revokes the certificate for a domain with certbot, and
-// turns SSL off in the config when it was the one in use.
-func revokeCert(cfg *Config, domain string) {
-	certPath := filepath.Join(letsEncryptDir, "live", domain, "cert.pem")
+// clearSavedDomain is submenu 3: forget the saved domain, so it
+// stops showing on top of the menu. If SSL was on for that domain,
+// it is switched off too and the web UI restarts on plain http.
+func clearSavedDomain(cfg *Config) {
+	if cfg.Domain == "" && !cfg.TLSEnabled {
+		fmt.Println("No saved domain to clear.")
+		return
+	}
+	domain := cfg.Domain
+	wasTLS := cfg.TLSEnabled
+	cfg.Domain = ""
+	cfg.TLSEnabled = false
+	cfg.CertFile, cfg.KeyFile = "", ""
+	_ = saveConfig(*cfg)
+	if wasTLS {
+		fmt.Println("Saved domain cleared and SSL switched off (it was for " + domain + ").")
+		if isServiceRunning(*cfg) {
+			fmt.Println("Restarting the web UI to serve http again…")
+			if err := restartService(*cfg); err != nil {
+				fmt.Println("SSL is off, but the web UI could not be restarted:", err)
+				fmt.Println("Start it with option 1.")
+				return
+			}
+			fmt.Println("Web UI is now serving http on port", cfg.Port)
+		} else {
+			fmt.Println("The web UI is stopped; start it with option 1 when ready.")
+		}
+	} else {
+		fmt.Println("Saved domain cleared. The web link now shows your server IP.")
+	}
+}
+
+// revokeCert revokes a certificate with certbot, and turns SSL off in
+// the config when it was the one in use. cert identifies the lineage
+// (its folder name may differ from the domain it covers).
+func revokeCert(cfg *Config, cert certInfo) {
+	certPath := filepath.Join(letsEncryptDir, "live", cert.lineage, "cert.pem")
 	if _, err := exec.LookPath("certbot"); err != nil {
 		fmt.Println("certbot is not installed — nothing was revoked and nothing was deleted.")
 		fmt.Println("To revoke this certificate by hand, run:")
 		fmt.Println("  sudo certbot revoke --cert-path " + certPath + " --delete-after-revoke")
-		fmt.Println("  sudo rm -rf " + filepath.Join(letsEncryptDir, "live", domain) + " " + filepath.Join(letsEncryptDir, "archive", domain) + " " + filepath.Join(letsEncryptDir, "renewal", domain+".conf"))
+		fmt.Println("  sudo rm -rf " + filepath.Join(letsEncryptDir, "live", cert.lineage) + " " + filepath.Join(letsEncryptDir, "archive", cert.lineage) + " " + filepath.Join(letsEncryptDir, "renewal", cert.lineage+".conf"))
 		return
 	}
 	fmt.Println("Running certbot revoke — this may ask for sudo…")
@@ -736,8 +901,11 @@ func revokeCert(cfg *Config, domain string) {
 		fmt.Println("Nothing was changed.")
 		return
 	}
-	fmt.Println("Certificate for", domain, "revoked.")
-	if cfg.Domain == domain && cfg.TLSEnabled {
+	fmt.Println("Certificate for", cert.primaryDomain(), "revoked.")
+	if cert.lineage != cert.primaryDomain() {
+		fmt.Println("(certificate " + cert.lineage + ")")
+	}
+	if cfg.TLSEnabled && cert.covers(cfg.Domain) {
 		cfg.TLSEnabled = false
 		cfg.CertFile, cfg.KeyFile = "", ""
 		_ = saveConfig(*cfg)
