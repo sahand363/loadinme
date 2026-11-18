@@ -21,6 +21,28 @@ protects the whole thing.
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
 
+## v0.6.1
+
+- **Certificates are matched by the domains they cover, not by folder
+  name** — a certificate's folder under `/etc/letsencrypt/live/` can
+  differ from the domain it covers (a multi-domain certificate, or a
+  lineage named `example.com-0001`). The list in menu 6 → 2 now shows
+  each certificate under the domains it actually covers, with its
+  expiry date; Get SSL (6 → 1) finds a certificate that already
+  covers the domain and offers to enable HTTPS with it instead of
+  running certbot again (certbot used to ask, in red, whether to
+  change that certificate's key type from ECDSA to RSA — that question
+  was only ever about that one certificate, never about the others,
+  but it should never have been asked at all); revoking by domain
+  finds the right certificate the same way. When several certificates
+  cover one domain, you pick one by number. New certificates are made
+  with `--cert-name <domain>` so their folder is named after the
+  domain from now on.
+- **Clear saved domain (menu 6 → 3)** — the saved domain shown on top
+  of the menu can now be cleared; if SSL was on for it, SSL is
+  switched off too and the web UI restarts on plain `http://` when it
+  was running.
+
 ## v0.6.0
 
 - **Domain & SSL in one menu option** — getting SSL used to take two
@@ -106,7 +128,7 @@ Run `loadinme menu`. The web UI link is printed first, then:
 | 3 | Restart web UI |
 | 4 | Status (address, port, limits, item count) |
 | 5 | Change port |
-| 6 | Domain & SSL (1 Get SSL, 2 List certificates & revoke one) |
+| 6 | Domain & SSL (1 Get SSL, 2 List certificates & revoke one, 3 Clear saved domain) |
 | 7 | Update LoadInMe (downloads the latest release binary, then restarts the web UI with it) |
 | 8 | Reset / change username & password (no old password needed; logs out all browsers) |
 | 9 | View settings |
