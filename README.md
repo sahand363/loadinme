@@ -21,6 +21,33 @@ protects the whole thing.
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
 
+## v0.6.2
+
+- **HTTPS links now carry your chosen port** — with SSL on and a port
+  like 2343, the menu used to show `https://your-domain` with no port,
+  which a browser opens on 443, where LoadInMe is not listening (it
+  serves HTTPS on the port you chose). The link now shows
+  `https://your-domain:2343` (and plain `https://your-domain` only
+  when the port really is 443). The same fix applies to the address
+  printed when the server starts.
+- **Get SSL checks port 80 first** — certbot's standalone mode needs
+  port 80 free for a few seconds to prove the domain is yours (a Let's
+  Encrypt rule). On a server that already runs other websites port 80
+  is usually taken, so certbot would only fail. The menu now checks
+  first and, when port 80 is busy, says so plainly: certbot only needs
+  port 80 for a few seconds, and freeing it that briefly is safe (the
+  service just pauses and comes back — nothing breaks). It prints the
+  exact steps — `sudo ss -tlnp | grep ':80'` to see what is using it,
+  stop that service briefly, run Get SSL again, start it back — and
+  restarts the web UI instead of running certbot. The app never stops
+  the other service itself; that stays your call.
+- **No more double-confirm after leaving a submenu** — pressing 0 to
+  go back from Domain & SSL (or 0 to cancel changing the port) used to
+  be followed by "Press Enter to return to the menu". That extra Enter
+  is gone; the main menu comes back straight away. The pause stays
+  after screens that print results worth reading (Status, settings,
+  update, and so on).
+
 ## v0.6.1
 
 - **Certificates are matched by the domains they cover, not by folder
