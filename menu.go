@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -26,9 +29,9 @@ import (
 //
 // Menu:
 //   1 Start   2 Stop   3 Restart   4 Status   5 Change port
-//   6 Set domain   7 SSL with Let's Encrypt   8 Update
-//   9 Reset / change username & password   10 View settings
-//   11 Show web UI link   12 Uninstall   0 Exit (silent, no farewell)
+//   6 Domain & SSL (1 Get SSL, 2 List & revoke)   7 Update
+//   8 Reset / change username & password   9 View settings
+//   10 Show web UI link   11 Uninstall   0 Exit (silent, no farewell)
 
 func webAddressFor(cfg Config) string {
 	if cfg.Domain != "" {
@@ -448,10 +451,16 @@ func withServiceStopped(cfg Config, fn func() error) error {
 	return fnErr
 }
 
+// letsEncryptDir is the base directory of the Let's Encrypt data
+// (/etc/letsencrypt/live/<domain>/ holds each certificate). It is a
+// variable, not a constant, so tests can point it at a temp dir —
+// the real /etc/letsencrypt is root-owned and may not exist here.
+var letsEncryptDir = "/etc/letsencrypt"
+
 // findCerts looks for a Let's Encrypt certificate for a domain.
 func findCerts(domain string) (cert, key string, ok bool) {
-	cert = filepath.Join("/etc/letsencrypt/live", domain, "fullchain.pem")
-	key = filepath.Join("/etc/letsencrypt/live", domain, "privkey.pem")
+	cert = filepath.Join(letsEncryptDir, "live", domain, "fullchain.pem")
+	key = filepath.Join(letsEncryptDir, "live", domain, "privkey.pem")
 	if _, err := os.Stat(cert); err != nil {
 		return "", "", false
 	}
@@ -461,12 +470,61 @@ func findCerts(domain string) (cert, key string, ok bool) {
 	return cert, key, true
 }
 
-func setupSSL(cfg *Config, scanner *bufio.Scanner) {
-	if strings.TrimSpace(cfg.Domain) == "" {
-		fmt.Println("Set a domain first (menu option 6), then come back here.")
+// domainSSLMenu is the "Domain & SSL" submenu (menu option 6):
+// 1 gets an SSL certificate, 2 lists certificates and revokes one,
+// 0 goes back to the main menu (never exits the app).
+func domainSSLMenu(cfg *Config, scanner *bufio.Scanner) {
+	for {
+		fmt.Println("  Domain & SSL")
+		if cfg.Domain != "" {
+			ssl := "off"
+			if cfg.TLSEnabled {
+				ssl = "on"
+			}
+			fmt.Println("  Domain:", cfg.Domain, " ·  SSL:", ssl)
+		} else {
+			fmt.Println("  Domain: (none set)")
+		}
+		fmt.Println("  1  Get SSL (enter domain, then email)")
+		fmt.Println("  2  List certificates & revoke one")
+		fmt.Println("  0  Back to main menu")
+		fmt.Println()
+		fmt.Print("  Choose [0-2]: ")
+		if !scanner.Scan() {
+			return
+		}
+		choice := strings.TrimSpace(scanner.Text())
+		fmt.Println()
+		switch choice {
+		case "1":
+			getSSLCert(cfg, scanner)
+		case "2":
+			listAndRevokeCerts(cfg, scanner)
+		case "0":
+			return
+		default:
+			fmt.Println("Please choose 0-2.")
+		}
+	}
+}
+
+// getSSLCert is submenu 1: enter a domain, then an email, and get a
+// Let's Encrypt certificate for it (or enable HTTPS with one that
+// already exists). The domain is saved as soon as it is entered, so
+// the next visit already knows it.
+func getSSLCert(cfg *Config, scanner *bufio.Scanner) {
+	domain, cancelled := promptCancel(scanner, "Domain (example: files.example.com)", cfg.Domain)
+	if cancelled {
+		fmt.Println("Cancelled.")
 		return
 	}
-	domain := cfg.Domain
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		fmt.Println("A domain is required. Nothing changed.")
+		return
+	}
+	cfg.Domain = domain
+	_ = saveConfig(*cfg)
 	if cert, key, ok := findCerts(domain); ok {
 		fmt.Println("Certificate already found:")
 		fmt.Println("  ", cert)
@@ -477,10 +535,7 @@ func setupSSL(cfg *Config, scanner *bufio.Scanner) {
 			return
 		}
 		if strings.ToLower(ans) == "y" || strings.ToLower(ans) == "yes" {
-			cfg.TLSEnabled = true
-			cfg.CertFile, cfg.KeyFile = cert, key
-			_ = saveConfig(*cfg)
-			fmt.Println("SSL is on. Restart the web UI (option 3) to serve https://" + domain)
+			enableSSL(cfg, cert, key)
 		}
 		return
 	}
@@ -503,7 +558,8 @@ func setupSSL(cfg *Config, scanner *bufio.Scanner) {
 		fmt.Println("An email is required by certbot. Nothing changed.")
 		return
 	}
-	if isServiceRunning(*cfg) {
+	wasRunning := isServiceRunning(*cfg)
+	if wasRunning {
 		fmt.Println("Stopping the web UI first — certbot needs port 80 free.")
 		_ = stopService(*cfg)
 	}
@@ -514,18 +570,190 @@ func setupSSL(cfg *Config, scanner *bufio.Scanner) {
 	if err := cmd.Run(); err != nil {
 		fmt.Println("certbot failed:", err)
 		fmt.Println("Check that the domain points at this server and port 80 is open, then try again.")
+		if wasRunning {
+			restartAfterSSL(cfg)
+		}
 		return
 	}
 	cert, key, ok := findCerts(domain)
 	if !ok {
-		fmt.Println("certbot finished but I cannot find the certificate. Check /etc/letsencrypt/live/" + domain + "/")
+		fmt.Println("certbot finished but I cannot find the certificate. Check " + filepath.Join(letsEncryptDir, "live", domain) + "/")
+		if wasRunning {
+			restartAfterSSL(cfg)
+		}
 		return
 	}
+	enableSSL(cfg, cert, key)
+}
+
+// enableSSL turns TLS on with the given certificate and restarts the
+// web UI when it was running, so https serves right away instead of
+// waiting for a manual restart.
+func enableSSL(cfg *Config, cert, key string) {
 	cfg.TLSEnabled = true
 	cfg.CertFile, cfg.KeyFile = cert, key
 	_ = saveConfig(*cfg)
 	fmt.Println("SSL is on — certificate found at", cert)
-	fmt.Println("Restart the web UI (option 3) to serve https://" + domain)
+	if isServiceRunning(*cfg) {
+		fmt.Println("Restarting the web UI to serve https://" + cfg.Domain + "…")
+		if err := restartService(*cfg); err != nil {
+			fmt.Println("SSL is on, but the web UI could not be restarted:", err)
+			fmt.Println("Start it with option 1.")
+			return
+		}
+		fmt.Println("Web UI is now serving https://" + cfg.Domain)
+	} else {
+		fmt.Println("Start the web UI with option 1 to serve https://" + cfg.Domain)
+	}
+}
+
+// restartAfterSSL restarts the web UI after an SSL step that stopped
+// it but did not enable SSL (e.g. certbot failed) — the UI must not
+// be left down.
+func restartAfterSSL(cfg *Config) {
+	fmt.Println("Restarting the web UI…")
+	if err := restartService(*cfg); err != nil {
+		fmt.Println("The web UI could not be restarted:", err)
+		fmt.Println("Start it with option 1.")
+	}
+}
+
+// certInfo is one certificate found under <letsEncryptDir>/live/.
+type certInfo struct {
+	domain    string
+	expiry    time.Time
+	hasExpiry bool
+}
+
+// listCerts returns every certificate under <letsEncryptDir>/live/.
+// Each subdirectory is one certificate; the expiry is read from the
+// certificate itself (crypto/x509, no openssl needed).
+func listCerts() ([]certInfo, error) {
+	liveDir := filepath.Join(letsEncryptDir, "live")
+	entries, err := os.ReadDir(liveDir)
+	if err != nil {
+		return nil, err
+	}
+	var out []certInfo
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info := certInfo{domain: e.Name()}
+		if b, err := os.ReadFile(filepath.Join(liveDir, e.Name(), "fullchain.pem")); err == nil {
+			if block, _ := pem.Decode(b); block != nil {
+				if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
+					info.expiry = cert.NotAfter
+					info.hasExpiry = true
+				}
+			}
+		}
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].domain < out[j].domain })
+	return out, nil
+}
+
+// listAndRevokeCerts is submenu 2: show every Let's Encrypt
+// certificate with its expiry date, and revoke one by domain.
+func listAndRevokeCerts(cfg *Config, scanner *bufio.Scanner) {
+	liveDir := filepath.Join(letsEncryptDir, "live")
+	certs, err := listCerts()
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("No certificates found (checked", liveDir+").")
+			return
+		}
+		fmt.Println("Could not read", liveDir, "—", err)
+		fmt.Println("The certificate directory is usually only readable as root: run the menu with sudo (sudo loadinme menu) and try again.")
+		return
+	}
+	if len(certs) == 0 {
+		fmt.Println("No certificates found (checked", liveDir+").")
+		return
+	}
+	fmt.Println("Certificates in", liveDir+":")
+	for _, c := range certs {
+		expiry := "expiry unknown"
+		if c.hasExpiry {
+			expiry = "expires " + c.expiry.Format("2006-01-02")
+		}
+		inUse := ""
+		if c.domain == cfg.Domain && cfg.TLSEnabled {
+			inUse = "  (in use)"
+		}
+		fmt.Printf("  %s — %s%s\n", c.domain, expiry, inUse)
+	}
+	domain, cancelled := promptCancel(scanner, "Domain to revoke", "")
+	if cancelled {
+		fmt.Println("Cancelled.")
+		return
+	}
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		fmt.Println("No domain given. Nothing revoked.")
+		return
+	}
+	found := false
+	for _, c := range certs {
+		if c.domain == domain {
+			found = true
+			break
+		}
+	}
+	if !found {
+		fmt.Println("No certificate found for", domain+". Nothing revoked.")
+		return
+	}
+	ans, cancelled := promptCancel(scanner, "Revoke the certificate for "+domain+"? This cannot be undone (y/n)", "n")
+	if cancelled {
+		fmt.Println("Cancelled.")
+		return
+	}
+	if strings.ToLower(ans) != "y" && strings.ToLower(ans) != "yes" {
+		fmt.Println("Not revoked.")
+		return
+	}
+	revokeCert(cfg, domain)
+}
+
+// revokeCert revokes the certificate for a domain with certbot, and
+// turns SSL off in the config when it was the one in use.
+func revokeCert(cfg *Config, domain string) {
+	certPath := filepath.Join(letsEncryptDir, "live", domain, "cert.pem")
+	if _, err := exec.LookPath("certbot"); err != nil {
+		fmt.Println("certbot is not installed — nothing was revoked and nothing was deleted.")
+		fmt.Println("To revoke this certificate by hand, run:")
+		fmt.Println("  sudo certbot revoke --cert-path " + certPath + " --delete-after-revoke")
+		fmt.Println("  sudo rm -rf " + filepath.Join(letsEncryptDir, "live", domain) + " " + filepath.Join(letsEncryptDir, "archive", domain) + " " + filepath.Join(letsEncryptDir, "renewal", domain+".conf"))
+		return
+	}
+	fmt.Println("Running certbot revoke — this may ask for sudo…")
+	cmd := exec.Command("sudo", "certbot", "revoke", "--cert-path", certPath, "--delete-after-revoke", "--non-interactive")
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	if err := cmd.Run(); err != nil {
+		fmt.Println("certbot revoke failed:", err)
+		fmt.Println("Nothing was changed.")
+		return
+	}
+	fmt.Println("Certificate for", domain, "revoked.")
+	if cfg.Domain == domain && cfg.TLSEnabled {
+		cfg.TLSEnabled = false
+		cfg.CertFile, cfg.KeyFile = "", ""
+		_ = saveConfig(*cfg)
+		fmt.Println("SSL is now off — that was the certificate in use.")
+		if isServiceRunning(*cfg) {
+			fmt.Println("Restarting the web UI to serve http again…")
+			if err := restartService(*cfg); err != nil {
+				fmt.Println("SSL is off, but the web UI could not be restarted:", err)
+				fmt.Println("Start it with option 1.")
+				return
+			}
+			fmt.Println("Web UI is now serving http://" + cfg.Domain)
+		} else {
+			fmt.Println("The web UI is stopped; start it with option 1 when ready.")
+		}
+	}
 }
 
 // selfUpdate downloads the latest release binary, replaces the
@@ -690,6 +918,12 @@ func withStore(cfg *Config, fn func(*Store) error) error {
 }
 
 func runMenu(cfg *Config) {
+	// Tests point the certificate directory at a temp dir (via env,
+	// which the menu child process inherits) so the list / revoke
+	// flows do not depend on the machine's real /etc/letsencrypt.
+	if d := os.Getenv("LOADINME_LETSENCRYPT_DIR"); d != "" {
+		letsEncryptDir = d
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for {
@@ -699,16 +933,15 @@ func runMenu(cfg *Config) {
 		fmt.Println("  3  Restart web UI")
 		fmt.Println("  4  Status")
 		fmt.Println("  5  Change port")
-		fmt.Println("  6  Set domain")
-		fmt.Println("  7  SSL with Let's Encrypt")
-		fmt.Println("  8  Update LoadInMe")
-		fmt.Println("  9  Reset / change username & password")
-		fmt.Println("  10 View settings")
-		fmt.Println("  11 Show web UI link")
-		fmt.Println("  12 Uninstall")
+		fmt.Println("  6  Domain & SSL")
+		fmt.Println("  7  Update LoadInMe")
+		fmt.Println("  8  Reset / change username & password")
+		fmt.Println("  9  View settings")
+		fmt.Println("  10 Show web UI link")
+		fmt.Println("  11 Uninstall")
 		fmt.Println("  0  Exit")
 		fmt.Println()
-		fmt.Print("  Choose [0-12]: ")
+		fmt.Print("  Choose [0-11]: ")
 		if !scanner.Scan() {
 			return
 		}
@@ -785,33 +1018,16 @@ func runMenu(cfg *Config) {
 			}
 			pause(scanner)
 		case "6":
-			domain, cancelled := promptCancel(scanner, "Domain (example: files.example.com, blank to clear)", cfg.Domain)
-			if cancelled {
-				fmt.Println("Cancelled.")
-				pause(scanner)
-				continue
-			}
-			cfg.Domain = strings.TrimSpace(domain)
-			_ = saveConfig(*cfg)
-			if cfg.Domain == "" {
-				fmt.Println("Domain cleared. The web link now shows your server IP.")
-			} else {
-				fmt.Println("Domain set to", cfg.Domain)
-				fmt.Println("Web link is now:", webAddressFor(*cfg))
-				fmt.Println("For https, set up SSL with option 7.")
-			}
+			domainSSLMenu(cfg, scanner)
 			pause(scanner)
 		case "7":
-			setupSSL(cfg, scanner)
-			pause(scanner)
-		case "8":
 			if err := selfUpdate(*cfg); err != nil {
 				fmt.Println("Update failed:", err)
 				fmt.Println("You can also run the installer again:")
 				fmt.Println("  curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash")
 			}
 			pause(scanner)
-		case "9":
+		case "8":
 			// The UI must be stopped first: while it runs, its
 			// exclusive database lock blocks any password change.
 			// withServiceStopped restarts it afterwards, even on cancel.
@@ -837,7 +1053,7 @@ func runMenu(cfg *Config) {
 				}
 			}
 			pause(scanner)
-		case "10":
+		case "9":
 			err := withStore(cfg, func(store *Store) error {
 				st, err := store.GetSettings()
 				if err != nil {
@@ -857,11 +1073,11 @@ func runMenu(cfg *Config) {
 				fmt.Println("Could not open data store: the web UI is running and holds the database — stop it first (option 2), or check Settings in the web UI.")
 			}
 			pause(scanner)
-		case "11":
+		case "10":
 			fmt.Println("Web UI:", webAddressFor(*cfg))
 			fmt.Println("Local:  http://localhost:" + strconv.Itoa(cfg.Port))
 			pause(scanner)
-		case "12":
+		case "11":
 			if uninstall(*cfg, scanner) {
 				pause(scanner)
 				return
@@ -870,7 +1086,7 @@ func runMenu(cfg *Config) {
 		case "0", "q", "quit", "exit":
 			return
 		default:
-			fmt.Println("Please choose 0-12.")
+			fmt.Println("Please choose 0-11.")
 			pause(scanner)
 		}
 	}
