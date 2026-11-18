@@ -1286,7 +1286,7 @@ func TestDomainSSLGetNoCertbot(t *testing.T) {
 	port := freePort(t)
 	// 6 = Domain & SSL, 1 = Get SSL, domain, email, 0 = back to the
 	// main menu, Enter at the pause, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n1\nexample.com\nuser@example.com\n0\n\n0\n")
+	out := runMenuInput(t, bin, dataDir, port, "6\n1\nexample.com\nuser@example.com\n0\n0\n")
 	if !strings.Contains(out, "certbot is not installed") {
 		t.Fatalf("missing certbot guidance:\n%s", out)
 	}
@@ -1318,7 +1318,7 @@ func TestDomainSSLListNone(t *testing.T) {
 	port := freePort(t)
 	leDir := t.TempDir() // no live/ inside: no certificates at all
 	// 6 = Domain & SSL, 2 = List & revoke, 0 = back, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n2\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	out := runMenuInput(t, bin, dataDir, port, "6\n2\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
 	if !strings.Contains(out, "No certificates found") {
 		t.Fatalf("missing 'no certificates' message:\n%s", out)
 	}
@@ -1345,7 +1345,7 @@ func TestDomainSSLRevokeFakeCertNoCertbot(t *testing.T) {
 	expiry := writeFakeCert(t, leDir, "example.com", time.Now().Add(90*24*time.Hour))
 	// 6 = Domain & SSL, 2 = List & revoke, domain, y = confirm,
 	// 0 = back, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n2\nexample.com\ny\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	out := runMenuInput(t, bin, dataDir, port, "6\n2\nexample.com\ny\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
 	if !strings.Contains(out, "example.com") || !strings.Contains(out, "expires "+expiry.Format("2006-01-02")) {
 		t.Fatalf("list did not show the certificate with its expiry:\n%s", out)
 	}
@@ -1374,13 +1374,17 @@ func TestDomainSSLSubmenuBackToMain(t *testing.T) {
 	bin := buildTestBinary(t)
 	dataDir := t.TempDir()
 	port := freePort(t)
-	// 6 = Domain & SSL, 0 = back to main menu, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n0\n\n0\n")
+	// 6 = Domain & SSL, 0 = back to main menu, 0 = exit. Leaving the
+	// submenu must NOT ask for an extra Enter first (v0.6.2).
+	out := runMenuInput(t, bin, dataDir, port, "6\n0\n0\n")
 	if !strings.Contains(out, "Domain & SSL") {
 		t.Fatalf("submenu never opened:\n%s", out)
 	}
 	if strings.Count(out, "Choose [0-11]") < 2 {
 		t.Fatalf("main menu was not shown again after leaving the submenu:\n%s", out)
+	}
+	if strings.Contains(out, "Press Enter") {
+		t.Fatalf("leaving the submenu asked for an extra Enter:\n%s", out)
 	}
 	if strings.Contains(out, "Bye") {
 		t.Fatalf("menu printed a farewell:\n%s", out)
@@ -1404,7 +1408,7 @@ func TestDomainSSLListAndRevokeByCoveredDomain(t *testing.T) {
 	expiry := writeFakeCertFolder(t, leDir, "other-0001", []string{"demo.example.com"}, time.Now().Add(90*24*time.Hour))
 	// 6 = Domain & SSL, 2 = List & revoke, domain, y = confirm,
 	// 0 = back, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n2\ndemo.example.com\ny\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	out := runMenuInput(t, bin, dataDir, port, "6\n2\ndemo.example.com\ny\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
 	if !strings.Contains(out, "demo.example.com") || !strings.Contains(out, "expires "+expiry.Format("2006-01-02")) {
 		t.Fatalf("list did not show the certificate under its domain:\n%s", out)
 	}
@@ -1441,7 +1445,7 @@ func TestDomainSSLGetUsesCoveringCert(t *testing.T) {
 	writeFakeCertFolder(t, leDir, "other-0001", []string{"demo.example.com"}, time.Now().Add(90*24*time.Hour))
 	// 6 = Domain & SSL, 1 = Get SSL, domain, y = enable, 0 = back,
 	// Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n1\ndemo.example.com\ny\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	out := runMenuInput(t, bin, dataDir, port, "6\n1\ndemo.example.com\ny\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
 	if !strings.Contains(out, "Certificate already found") {
 		t.Fatalf("Get SSL did not find the covering certificate:\n%s", out)
 	}
@@ -1478,7 +1482,7 @@ func TestDomainSSLGetPicksAmongCoveringCerts(t *testing.T) {
 	writeFakeCertFolder(t, leDir, "demo.example.com-0001", []string{"demo.example.com"}, time.Now().Add(30*24*time.Hour))
 	writeFakeCertFolder(t, leDir, "demo.example.com-0002", []string{"demo.example.com"}, time.Now().Add(60*24*time.Hour))
 	// 6, 1, domain, pick 2, y = enable, 0 = back, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n1\ndemo.example.com\n2\ny\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	out := runMenuInput(t, bin, dataDir, port, "6\n1\ndemo.example.com\n2\ny\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
 	if !strings.Contains(out, "More than one certificate covers") {
 		t.Fatalf("Get SSL did not list the covering certificates:\n%s", out)
 	}
@@ -1520,9 +1524,8 @@ func TestDomainSSLClearSavedDomain(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataDir, "config.json"), b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// 6 = Domain & SSL, 3 = Clear saved domain, 0 = back, Enter,
-	// 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n3\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	// 6 = Domain & SSL, 3 = Clear saved domain, 0 = back, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n3\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
 	if !strings.Contains(out, "Saved domain cleared") {
 		t.Fatalf("missing clear confirmation:\n%s", out)
 	}
@@ -1548,5 +1551,84 @@ func TestDomainSSLClearSavedDomain(t *testing.T) {
 	}
 	if cfg.TLSEnabled || cfg.CertFile != "" || cfg.KeyFile != "" {
 		t.Fatalf("SSL was not switched off: %+v", cfg)
+	}
+}
+
+// --- v0.6.2: HTTPS link carries the chosen port; port 80 checked
+// before certbot; no double-confirm after leaving a submenu ---
+
+// webAddressFor (and webAddressHost, used by the server's startup
+// line) must show the port HTTPS actually serves on. A browser opens
+// https://domain with no port on 443, where nothing listens, so the
+// page never came up.
+func TestWebAddressFor(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  Config
+		want string
+	}{
+		{"TLS on, port 2343", Config{Domain: "demo.example.com", Port: 2343, TLSEnabled: true}, "https://demo.example.com:2343"},
+		{"TLS on, port 443", Config{Domain: "demo.example.com", Port: 443, TLSEnabled: true}, "https://demo.example.com"},
+		{"TLS on, port 8080", Config{Domain: "demo.example.com", Port: 8080, TLSEnabled: true}, "https://demo.example.com:8080"},
+		{"TLS off, port 80", Config{Domain: "demo.example.com", Port: 80}, "http://demo.example.com"},
+		{"TLS off, port 5234", Config{Domain: "demo.example.com", Port: 5234}, "http://demo.example.com:5234"},
+		{"TLS off, port 2343", Config{Domain: "demo.example.com", Port: 2343}, "http://demo.example.com:2343"},
+	}
+	for _, c := range cases {
+		if got := webAddressFor(c.cfg); got != c.want {
+			t.Errorf("%s: webAddressFor = %q, want %q", c.name, got, c.want)
+		}
+		if got := webAddressHost(c.cfg); got != strings.TrimPrefix(c.want, "http://") && got != strings.TrimPrefix(c.want, "https://") {
+			t.Errorf("%s: webAddressHost = %q, want %q", c.name, got, strings.TrimPrefix(strings.TrimPrefix(c.want, "http://"), "https://"))
+		}
+	}
+}
+
+// portFree: a port held by a listener is not free; once the listener
+// closes, it is free again.
+func TestPortFree(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if portFree(port) {
+		ln.Close()
+		t.Fatalf("portFree(%d) = true while a listener holds it", port)
+	}
+	_ = ln.Close()
+	if !portFree(port) {
+		t.Fatalf("portFree(%d) = false after the listener closed", port)
+	}
+}
+
+// Driving the menu 6 → 0 → 0 must never print "Press Enter" and must
+// exit silently (no Bye). This is the v0.6.2 double-confirm fix.
+func TestMenuNoPauseOnSubmenuExit(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	out := runMenuInput(t, bin, dataDir, port, "6\n0\n0\n")
+	if strings.Contains(out, "Press Enter") {
+		t.Fatalf("menu asked for an extra Enter after leaving the submenu:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
+	}
+}
+
+// Same check on the Clear saved domain path (6 → 3 → 0 → 0): no
+// stray pause after the submenu returns to the main menu.
+func TestMenuNoPauseOnClearDomain(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	leDir := t.TempDir()
+	out := runMenuInput(t, bin, dataDir, port, "6\n3\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	if strings.Contains(out, "Press Enter") {
+		t.Fatalf("menu asked for an extra Enter after clearing the domain:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
 	}
 }
