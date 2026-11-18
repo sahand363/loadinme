@@ -37,7 +37,13 @@ import (
 func webAddressFor(cfg Config) string {
 	if cfg.Domain != "" {
 		if cfg.TLSEnabled {
-			return "https://" + cfg.Domain
+			// HTTPS serves on the chosen port, not on 443 (unless
+			// the user chose 443): a link without the port would
+			// open in the browser on 443, where nothing listens.
+			if cfg.Port == 443 {
+				return "https://" + cfg.Domain
+			}
+			return fmt.Sprintf("https://%s:%d", cfg.Domain, cfg.Port)
 		}
 		if cfg.Port == 80 {
 			return "http://" + cfg.Domain
@@ -583,7 +589,8 @@ func getSSLCert(cfg *Config, scanner *bufio.Scanner) {
 		return
 	}
 	fmt.Println("No certificate found yet for", domain)
-	fmt.Println("You need: a domain pointing at this server, and ports 80 and 443 open.")
+	fmt.Println("You need: a domain pointing at this server, and port 80 free for a few seconds while certbot runs.")
+	fmt.Println("The web UI keeps serving on your chosen port — the certificate does not move it to 443.")
 	if _, err := exec.LookPath("certbot"); err != nil {
 		fmt.Println("certbot is not installed. Run these commands on the server:")
 		fmt.Println("  sudo apt update && sudo apt install -y certbot")
@@ -605,6 +612,30 @@ func getSSLCert(cfg *Config, scanner *bufio.Scanner) {
 	if wasRunning {
 		fmt.Println("Stopping the web UI first — certbot needs port 80 free.")
 		_ = stopService(*cfg)
+	}
+	// certbot's --standalone mode must bind port 80 for a few seconds
+	// to prove the domain is yours (a Let's Encrypt rule, not ours).
+	// On a server that already runs other websites port 80 is usually
+	// taken — running certbot then would only fail, so check first.
+	if !portFree(80) {
+		fmt.Println("Port 80 is already in use on this server, so certbot cannot prove the domain is yours.")
+		fmt.Println("Something else is already using port 80 — probably the other website on this server.")
+		fmt.Println("certbot only needs port 80 for a few seconds. Freeing it that briefly is safe:")
+		fmt.Println("the service on it just pauses and comes back — nothing breaks, and at worst")
+		fmt.Println("a visitor's page waits a few seconds.")
+		fmt.Println("  1. See what is using port 80:")
+		fmt.Println("       sudo ss -tlnp | grep ':80'")
+		fmt.Println("  2. Stop that service briefly — for example, only if it is nginx:")
+		fmt.Println("       sudo systemctl stop nginx")
+		fmt.Println("  3. Run Get SSL again here, then start the service back:")
+		fmt.Println("       sudo systemctl start nginx")
+		fmt.Println("Or get the certificate another way (webroot or DNS) — once a certificate exists")
+		fmt.Println("for the domain, come back here and I will find it and turn SSL on.")
+		fmt.Println("Nothing was changed.")
+		if wasRunning {
+			restartAfterSSL(cfg)
+		}
+		return
 	}
 	fmt.Println("Running certbot — this may ask for sudo…")
 	// --cert-name names the new lineage after the domain, so future
@@ -640,16 +671,27 @@ func enableSSL(cfg *Config, cert, key string) {
 	_ = saveConfig(*cfg)
 	fmt.Println("SSL is on — certificate found at", cert)
 	if isServiceRunning(*cfg) {
-		fmt.Println("Restarting the web UI to serve https://" + cfg.Domain + "…")
+		fmt.Println("Restarting the web UI to serve " + webAddressFor(*cfg) + "…")
 		if err := restartService(*cfg); err != nil {
 			fmt.Println("SSL is on, but the web UI could not be restarted:", err)
 			fmt.Println("Start it with option 1.")
 			return
 		}
-		fmt.Println("Web UI is now serving https://" + cfg.Domain)
+		fmt.Println("Web UI is now serving " + webAddressFor(*cfg))
 	} else {
-		fmt.Println("Start the web UI with option 1 to serve https://" + cfg.Domain)
+		fmt.Println("Start the web UI with option 1 to serve " + webAddressFor(*cfg))
 	}
+}
+
+// portFree reports whether anything is listening on the given TCP
+// port right now: it tries to bind the port and lets go at once.
+func portFree(port int) bool {
+	ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
 }
 
 // restartAfterSSL restarts the web UI after an SSL step that stopped
@@ -1165,7 +1207,6 @@ func runMenu(cfg *Config) {
 			portStr, cancelled := promptCancel(scanner, "Web port", strconv.Itoa(cfg.Port))
 			if cancelled {
 				fmt.Println("Cancelled.")
-				pause(scanner)
 				continue
 			}
 			port, err := strconv.Atoi(portStr)
@@ -1187,7 +1228,9 @@ func runMenu(cfg *Config) {
 			pause(scanner)
 		case "6":
 			domainSSLMenu(cfg, scanner)
-			pause(scanner)
+			// No pause here: leaving the submenu (0) already
+			// returns to this menu, so asking for Enter as well
+			// would be confirming the same step twice.
 		case "7":
 			if err := selfUpdate(*cfg); err != nil {
 				fmt.Println("Update failed:", err)
