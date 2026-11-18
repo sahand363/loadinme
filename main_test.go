@@ -3,10 +3,17 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -899,7 +906,7 @@ func TestResetPasswordWhileServerRunning(t *testing.T) {
 	}
 }
 
-// 16b. Menu option 9 while the server is running: same flow through
+// 16b. Menu option 8 while the server is running: same flow through
 // the menu — stop, reset, restart, no farewell, server still up.
 func TestMenuResetPasswordWhileRunning(t *testing.T) {
 	bin := buildTestBinary(t)
@@ -930,8 +937,8 @@ func TestMenuResetPasswordWhileRunning(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	// 9 = reset password, new password twice, Enter at the pause, 0 = exit.
-	if _, err := io.WriteString(stdin, "9\nnewpass123\nnewpass123\n\n0\n"); err != nil {
+	// 8 = reset password, new password twice, Enter at the pause, 0 = exit.
+	if _, err := io.WriteString(stdin, "8\nnewpass123\nnewpass123\n\n0\n"); err != nil {
 		t.Fatal(err)
 	}
 	_ = stdin.Close()
@@ -1171,5 +1178,197 @@ func TestFirstRunPersistsOverridePort(t *testing.T) {
 	}
 	if cfg.Port != port {
 		t.Fatalf("first-run config port = %d, want %d", cfg.Port, port)
+	}
+}
+
+// --- v0.6.0: Domain & SSL in one menu option (6), with revoke ---
+
+// runMenuInput starts `loadinme menu`, feeds it input, waits for it
+// to exit, and returns its combined output. extraEnv is passed to
+// the menu child process (e.g. LOADINME_LETSENCRYPT_DIR to point the
+// certificate directory at a temp dir).
+func runMenuInput(t *testing.T, bin, dataDir string, port int, input string, extraEnv ...string) string {
+	t.Helper()
+	cmd := exec.Command(bin, "menu", "--port", strconv.Itoa(port), "--data-dir", dataDir)
+	cmd.Env = append(os.Environ(), extraEnv...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(stdin, input); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdin.Close()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("menu exited with error: %v\noutput:\n%s", err, buf.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("menu did not exit\noutput:\n%s", buf.String())
+	}
+	return buf.String()
+}
+
+// certbotInstalled reports whether certbot is on PATH. The SSL tests
+// that expect the "certbot is not installed" path skip when it is.
+func certbotInstalled() bool {
+	_, err := exec.LookPath("certbot")
+	return err == nil
+}
+
+// writeFakeCert writes a self-signed certificate (and a dummy private
+// key) for domain into <base>/live/<domain>/, the way certbot lays
+// certificates out. It returns the certificate's expiry date.
+func writeFakeCert(t *testing.T, base, domain string, notAfter time.Time) time.Time {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     notAfter,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(base, "live", domain)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(filepath.Join(dir, "fullchain.pem"), certPEM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "privkey.pem"), []byte("fake key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return notAfter
+}
+
+// Get SSL with certbot absent: the menu must print the
+// certbot-not-installed guidance, change no SSL setting, and return
+// to the menu. (The domain is saved — that is the point of submenu 1
+// — but TLS stays off and no certificate is configured.)
+func TestDomainSSLGetNoCertbot(t *testing.T) {
+	if certbotInstalled() {
+		t.Skip("certbot is installed; this test needs it absent")
+	}
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	// 6 = Domain & SSL, 1 = Get SSL, domain, email, 0 = back to the
+	// main menu, Enter at the pause, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n1\nexample.com\nuser@example.com\n0\n\n0\n")
+	if !strings.Contains(out, "certbot is not installed") {
+		t.Fatalf("missing certbot guidance:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
+	if err != nil {
+		t.Fatalf("config.json was not written: %v", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("parse config.json: %v", err)
+	}
+	if cfg.Domain != "example.com" {
+		t.Fatalf("saved domain = %q, want example.com", cfg.Domain)
+	}
+	if cfg.TLSEnabled || cfg.CertFile != "" || cfg.KeyFile != "" {
+		t.Fatalf("SSL changed without certbot: TLSEnabled=%v cert=%q key=%q", cfg.TLSEnabled, cfg.CertFile, cfg.KeyFile)
+	}
+}
+
+// List certificates with an empty letsencrypt dir: the submenu must
+// say plainly that none were found (and name the directory it
+// checked), then 0 returns to the main menu and 0 exits silently.
+func TestDomainSSLListNone(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	leDir := t.TempDir() // no live/ inside: no certificates at all
+	// 6 = Domain & SSL, 2 = List & revoke, 0 = back, Enter, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n2\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	if !strings.Contains(out, "No certificates found") {
+		t.Fatalf("missing 'no certificates' message:\n%s", out)
+	}
+	if !strings.Contains(out, filepath.Join(leDir, "live")) {
+		t.Fatalf("list did not name the directory checked:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
+	}
+}
+
+// List a fake self-signed certificate and "revoke" it with certbot
+// absent: the menu must show the certificate with its expiry date,
+// then print the manual revoke commands instead of deleting anything,
+// and leave the config untouched.
+func TestDomainSSLRevokeFakeCertNoCertbot(t *testing.T) {
+	if certbotInstalled() {
+		t.Skip("certbot is installed; this test needs it absent")
+	}
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	leDir := t.TempDir()
+	expiry := writeFakeCert(t, leDir, "example.com", time.Now().Add(90*24*time.Hour))
+	// 6 = Domain & SSL, 2 = List & revoke, domain, y = confirm,
+	// 0 = back, Enter, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n2\nexample.com\ny\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	if !strings.Contains(out, "example.com") || !strings.Contains(out, "expires "+expiry.Format("2006-01-02")) {
+		t.Fatalf("list did not show the certificate with its expiry:\n%s", out)
+	}
+	if !strings.Contains(out, "certbot is not installed") || !strings.Contains(out, "certbot revoke --cert-path") {
+		t.Fatalf("missing manual revoke commands:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
+	}
+	// Nothing was deleted and the config was not touched.
+	if _, err := os.Stat(filepath.Join(leDir, "live", "example.com", "fullchain.pem")); err != nil {
+		t.Fatalf("certificate was deleted without certbot: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dataDir, "config.json")); err == nil {
+		var cfg Config
+		if err := json.Unmarshal(b, &cfg); err == nil && (cfg.TLSEnabled || cfg.CertFile != "" || cfg.KeyFile != "") {
+			t.Fatalf("revoke changed the config without certbot: %+v", cfg)
+		}
+	}
+}
+
+// Submenu 0 returns to the main menu (it must NOT exit the app):
+// after 6 then 0, the main menu is printed again, and a second 0
+// exits silently with no farewell.
+func TestDomainSSLSubmenuBackToMain(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	// 6 = Domain & SSL, 0 = back to main menu, Enter, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n0\n\n0\n")
+	if !strings.Contains(out, "Domain & SSL") {
+		t.Fatalf("submenu never opened:\n%s", out)
+	}
+	if strings.Count(out, "Choose [0-11]") < 2 {
+		t.Fatalf("main menu was not shown again after leaving the submenu:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
 	}
 }
