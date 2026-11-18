@@ -21,6 +21,23 @@ protects the whole thing.
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
 
+## v0.6.0
+
+- **Domain & SSL in one menu option** — getting SSL used to take two
+  options (6 for the domain, then 7 for the email and the certificate).
+  Option 6 is now "Domain & SSL" with a submenu: 1 Get SSL (enter the
+  domain, then the email, and the certificate is fetched), 2 List
+  certificates & revoke one (shows every certificate with its expiry
+  date and which one is in use; type a domain to revoke it, with a
+  confirmation question first). Turning SSL on restarts the web UI
+  automatically when it was running, so `https://` serves right away;
+  revoking the certificate in use turns SSL off and restarts the UI
+  back on `http://`. Pressing 0 in the submenu goes back to the main
+  menu, and 0 at any prompt cancels that step.
+- **Menu renumbered** — with SSL folded into option 6, Update is now
+  7, Reset / change password is 8, View settings is 9, Show web UI
+  link is 10, and Uninstall is 11 (1–5 and 0 are unchanged).
+
 ## v0.5.0
 
 - **Copy button fixed** — it did nothing over plain `http://<server-IP>` because `navigator.clipboard` only exists in secure contexts. It now falls back to the classic textarea + `execCommand('copy')` approach, shows 'Copied!' only on real success, and 'Copy failed' if copying really fails.
@@ -28,7 +45,7 @@ protects the whole thing.
 
 ## v0.4.0
 
-- **Password reset from SSH, any time** — SSH menu option 9 is now
+- **Password reset from SSH, any time** — SSH menu option 8 is now
   "Reset / change username & password", and `loadinme reset-password`
   does the same from the command line. It never asks for the old
   password (a reset works even when the old one is forgotten), and it
@@ -39,7 +56,7 @@ protects the whole thing.
   step instead of becoming a value (it can never set the port to 0, the
   domain to "0", or the password to "0").
 - **Always restart after an update** — after a quick install or a menu
-  update (option 8), the web UI is stopped and started again with the
+  update (option 7), the web UI is stopped and started again with the
   new version, and the running version is printed, so updates always
   apply.
 
@@ -75,7 +92,7 @@ Specific version: `curl -fsSL https://raw.githubusercontent.com/sahfar363/loadin
 
 After installing or updating, the installer always restarts the web UI
 with the new version (stopping the old process first if it was
-running), so an update always applies. The menu's Update (option 8)
+running), so an update always applies. The menu's Update (option 7)
 does the same.
 
 ## SSH menu
@@ -89,13 +106,12 @@ Run `loadinme menu`. The web UI link is printed first, then:
 | 3 | Restart web UI |
 | 4 | Status (address, port, limits, item count) |
 | 5 | Change port |
-| 6 | Set domain |
-| 7 | SSL with Let's Encrypt (needs a domain + certbot) |
-| 8 | Update LoadInMe (downloads the latest release binary, then restarts the web UI with it) |
-| 9 | Reset / change username & password (no old password needed; logs out all browsers) |
-| 10 | View settings |
-| 11 | Show web UI link |
-| 12 | Uninstall (asks whether to keep your data) |
+| 6 | Domain & SSL (1 Get SSL, 2 List certificates & revoke one) |
+| 7 | Update LoadInMe (downloads the latest release binary, then restarts the web UI with it) |
+| 8 | Reset / change username & password (no old password needed; logs out all browsers) |
+| 9 | View settings |
+| 10 | Show web UI link |
+| 11 | Uninstall (asks whether to keep your data) |
 | 0 | Exit |
 
 Pressing 0 exits the menu, and typing 0 at any question cancels that
@@ -121,7 +137,7 @@ loadinme --help
 `set-password` and `reset-password` are the same: they set a new
 password without asking for the old one, and log out every
 browser/device (all sessions are cleared). Use them any time, not
-just on first setup — from the SSH menu (option 9) or the command line.
+just on first setup — from the SSH menu (option 8) or the command line.
 
 `start` starts the web UI in the background and waits until it answers
 `/health` (it does nothing if the UI is already running); `stop` stops
@@ -141,7 +157,7 @@ Environment: `LOADINME_PORT`, `LOADINME_DATA`.
 | Default expiry | 24 hours | 1–720 hours |
 
 Change them from the gear menu in the web UI (saved in the database),
-or view them from the SSH menu (option 10).
+or view them from the SSH menu (option 9).
 
 ## Data layout
 
