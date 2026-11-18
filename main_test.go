@@ -1225,19 +1225,25 @@ func certbotInstalled() bool {
 	return err == nil
 }
 
-// writeFakeCert writes a self-signed certificate (and a dummy private
-// key) for domain into <base>/live/<domain>/, the way certbot lays
-// certificates out. It returns the certificate's expiry date.
-func writeFakeCert(t *testing.T, base, domain string, notAfter time.Time) time.Time {
+// writeFakeCertFolder writes a self-signed certificate (and a dummy
+// private key) for domains into <base>/live/<folder>/, the way certbot
+// lays certificates out. folder may differ from the domains the
+// certificate covers (e.g. example.com-0001). It returns the
+// certificate's expiry date.
+func writeFakeCertFolder(t *testing.T, base, folder string, domains []string, notAfter time.Time) time.Time {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+	cn := folder
+	if len(domains) > 0 {
+		cn = domains[0]
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: domain},
-		DNSNames:     []string{domain},
+		Subject:      pkix.Name{CommonName: cn},
+		DNSNames:     domains,
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     notAfter,
 	}
@@ -1245,7 +1251,7 @@ func writeFakeCert(t *testing.T, base, domain string, notAfter time.Time) time.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(base, "live", domain)
+	dir := filepath.Join(base, "live", folder)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1257,6 +1263,14 @@ func writeFakeCert(t *testing.T, base, domain string, notAfter time.Time) time.T
 		t.Fatal(err)
 	}
 	return notAfter
+}
+
+// writeFakeCert writes a self-signed certificate (and a dummy private
+// key) for domain into <base>/live/<domain>/, the way certbot lays
+// certificates out. It returns the certificate's expiry date.
+func writeFakeCert(t *testing.T, base, domain string, notAfter time.Time) time.Time {
+	t.Helper()
+	return writeFakeCertFolder(t, base, domain, []string{domain}, notAfter)
 }
 
 // Get SSL with certbot absent: the menu must print the
@@ -1370,5 +1384,169 @@ func TestDomainSSLSubmenuBackToMain(t *testing.T) {
 	}
 	if strings.Contains(out, "Bye") {
 		t.Fatalf("menu printed a farewell:\n%s", out)
+	}
+}
+
+// --- v0.6.1: certificates matched by covered domain, not folder name ---
+
+// A certificate stored under a different folder name than its domain
+// must still be listed under the domain it covers, and revoking by
+// that domain must find it (certbot absent: manual commands, nothing
+// deleted, config untouched).
+func TestDomainSSLListAndRevokeByCoveredDomain(t *testing.T) {
+	if certbotInstalled() {
+		t.Skip("certbot is installed; this test needs it absent")
+	}
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	leDir := t.TempDir()
+	expiry := writeFakeCertFolder(t, leDir, "other-0001", []string{"demo.example.com"}, time.Now().Add(90*24*time.Hour))
+	// 6 = Domain & SSL, 2 = List & revoke, domain, y = confirm,
+	// 0 = back, Enter, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n2\ndemo.example.com\ny\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	if !strings.Contains(out, "demo.example.com") || !strings.Contains(out, "expires "+expiry.Format("2006-01-02")) {
+		t.Fatalf("list did not show the certificate under its domain:\n%s", out)
+	}
+	if !strings.Contains(out, "other-0001") {
+		t.Fatalf("list did not show the lineage name:\n%s", out)
+	}
+	if !strings.Contains(out, "certbot is not installed") || !strings.Contains(out, "certbot revoke --cert-path") {
+		t.Fatalf("missing manual revoke commands:\n%s", out)
+	}
+	if !strings.Contains(out, filepath.Join("live", "other-0001", "cert.pem")) {
+		t.Fatalf("revoke commands did not use the lineage path:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(leDir, "live", "other-0001", "fullchain.pem")); err != nil {
+		t.Fatalf("certificate was deleted without certbot: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dataDir, "config.json")); err == nil {
+		var cfg Config
+		if err := json.Unmarshal(b, &cfg); err == nil && (cfg.TLSEnabled || cfg.CertFile != "" || cfg.KeyFile != "") {
+			t.Fatalf("revoke changed the config without certbot: %+v", cfg)
+		}
+	}
+}
+
+// Get SSL for a domain whose certificate lives under another folder
+// name must offer to enable HTTPS with it instead of running certbot.
+func TestDomainSSLGetUsesCoveringCert(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	leDir := t.TempDir()
+	writeFakeCertFolder(t, leDir, "other-0001", []string{"demo.example.com"}, time.Now().Add(90*24*time.Hour))
+	// 6 = Domain & SSL, 1 = Get SSL, domain, y = enable, 0 = back,
+	// Enter, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n1\ndemo.example.com\ny\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	if !strings.Contains(out, "Certificate already found") {
+		t.Fatalf("Get SSL did not find the covering certificate:\n%s", out)
+	}
+	if strings.Contains(out, "Running certbot") {
+		t.Fatalf("Get SSL ran certbot for a domain that already has a certificate:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
+	if err != nil {
+		t.Fatalf("config.json was not written: %v", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("parse config.json: %v", err)
+	}
+	if !cfg.TLSEnabled {
+		t.Fatalf("TLS was not enabled: %+v", cfg)
+	}
+	want := filepath.Join(leDir, "live", "other-0001", "fullchain.pem")
+	if cfg.CertFile != want {
+		t.Fatalf("cert file = %q, want %q", cfg.CertFile, want)
+	}
+}
+
+// Several certificates covering one domain: Get SSL lists them and
+// lets the user pick one by number.
+func TestDomainSSLGetPicksAmongCoveringCerts(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	leDir := t.TempDir()
+	writeFakeCertFolder(t, leDir, "demo.example.com-0001", []string{"demo.example.com"}, time.Now().Add(30*24*time.Hour))
+	writeFakeCertFolder(t, leDir, "demo.example.com-0002", []string{"demo.example.com"}, time.Now().Add(60*24*time.Hour))
+	// 6, 1, domain, pick 2, y = enable, 0 = back, Enter, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n1\ndemo.example.com\n2\ny\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	if !strings.Contains(out, "More than one certificate covers") {
+		t.Fatalf("Get SSL did not list the covering certificates:\n%s", out)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
+	if err != nil {
+		t.Fatalf("config.json was not written: %v", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("parse config.json: %v", err)
+	}
+	want := filepath.Join(leDir, "live", "demo.example.com-0002", "fullchain.pem")
+	if cfg.CertFile != want {
+		t.Fatalf("cert file = %q, want the picked certificate %q", cfg.CertFile, want)
+	}
+}
+
+// Submenu 3 clears a saved domain (and switches SSL off when it was
+// on): the config ends up with no domain and TLS off, and the menu
+// afterwards shows no domain on top.
+func TestDomainSSLClearSavedDomain(t *testing.T) {
+	bin := buildTestBinary(t)
+	dataDir := t.TempDir()
+	port := freePort(t)
+	leDir := t.TempDir()
+	writeFakeCertFolder(t, leDir, "stale.example.com", []string{"stale.example.com"}, time.Now().Add(90*24*time.Hour))
+	seed := Config{
+		Port:       port,
+		DataDir:    dataDir,
+		Domain:     "stale.example.com",
+		TLSEnabled: true,
+		CertFile:   filepath.Join(leDir, "live", "stale.example.com", "fullchain.pem"),
+		KeyFile:    filepath.Join(leDir, "live", "stale.example.com", "privkey.pem"),
+	}
+	b, err := json.MarshalIndent(seed, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "config.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 6 = Domain & SSL, 3 = Clear saved domain, 0 = back, Enter,
+	// 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n3\n0\n\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	if !strings.Contains(out, "Saved domain cleared") {
+		t.Fatalf("missing clear confirmation:\n%s", out)
+	}
+	if !strings.Contains(out, "SSL switched off") {
+		t.Fatalf("clear did not say SSL was switched off:\n%s", out)
+	}
+	if !strings.Contains(out, "Domain: (none set)") {
+		t.Fatalf("menu still shows a domain after clearing:\n%s", out)
+	}
+	if strings.Contains(out, "Bye") {
+		t.Fatalf("menu printed a farewell:\n%s", out)
+	}
+	b, err = os.ReadFile(filepath.Join(dataDir, "config.json"))
+	if err != nil {
+		t.Fatalf("config.json was not written: %v", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatalf("parse config.json: %v", err)
+	}
+	if cfg.Domain != "" {
+		t.Fatalf("saved domain = %q, want empty", cfg.Domain)
+	}
+	if cfg.TLSEnabled || cfg.CertFile != "" || cfg.KeyFile != "" {
+		t.Fatalf("SSL was not switched off: %+v", cfg)
 	}
 }
