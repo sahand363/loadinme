@@ -110,7 +110,13 @@ func serve(store *Store, cfg Config) error {
 func webAddressHost(cfg Config) string {
 	if cfg.Domain != "" {
 		if cfg.TLSEnabled {
-			return cfg.Domain
+			// Same rule as webAddressFor: HTTPS serves on the
+			// chosen port, so the address must carry it unless
+			// the port is 443.
+			if cfg.Port == 443 {
+				return cfg.Domain
+			}
+			return fmt.Sprintf("%s:%d", cfg.Domain, cfg.Port)
 		}
 		if cfg.Port == 80 {
 			return cfg.Domain
