@@ -74,7 +74,9 @@ type sslPlan struct {
 	Block    string // nginx-conflict: file of the existing server block
 }
 
-func (p sslPlan) needsRoot() bool { return p.Method != methodDNSCloudflare }
+func (p sslPlan) needsRoot() bool {
+	return p.Method != methodDNSCloudflare && p.Method != methodSelf80
+}
 
 func nginxRunning() bool {
 	procs, _ := os.ReadDir("/proc")
@@ -87,13 +89,29 @@ func nginxRunning() bool {
 }
 
 // planHTTP picks the HTTP-01 strategy for this server.
-func planHTTP(domain string) sslPlan {
+func planHTTP(dataDir, domain string) sslPlan {
 	o := detectPort80()
 	if o.Free {
 		return sslPlan{Method: methodStandalone, Owner: o, Why: []string{
 			"Port 80 is free on this server, so LoadInMe answers Let's Encrypt on port 80 itself",
 			"for the few seconds of the check. Nothing else is touched.",
 		}}
+	}
+	// LoadInMe's own :80 listener (address without port, direct):
+	// it serves the challenge files this process writes.
+	if (o.Process == "" || o.Process == "loadinme") && selfAnswers80(dataDir) {
+		return sslPlan{Method: methodSelf80, Owner: o, Why: []string{
+			"LoadInMe itself holds port 80 (for the address without port). Its running port-80",
+			"listener answers Let's Encrypt; nothing pauses and nothing else is touched.",
+		}}
+	}
+	if isApacheName(o.Process) || (o.Process == "" && procRunning("apache2", "httpd")) {
+		if apacheChallengeVhost(domain) != "" {
+			return sslPlan{Method: methodApacheExisting, Owner: o, Block: apacheChallengeVhost(domain), Why: []string{
+				"Apache owns port 80 and serves LoadInMe's port-80 vhost for " + domain + ", which forwards",
+				"only the check to LoadInMe on 127.0.0.1:" + fmt.Sprint(acmeLoopbackPort()) + ". Apache keeps running.",
+			}}
+		}
 	}
 	isNginx := o.Process == "nginx" || (o.Process == "" && nginxRunning())
 	if isNginx {
@@ -187,7 +205,14 @@ func obtainWithPlan(cfg Config, domain, email string, plan sslPlan, out io.Write
 		}
 		defer remove()
 		opts.HTTP, opts.SelfCheck = cs, true
-	case methodNginxExisting:
+	case methodSelf80:
+		cd, err := newChallengeDir(cfg.DataDir)
+		if err != nil {
+			return nil, err
+		}
+		defer cd.Close()
+		opts.HTTP, opts.SelfCheck = cd, true
+	case methodNginxExisting, methodApacheExisting:
 		cs, err := startChallengeServer(fmt.Sprintf("127.0.0.1:%d", acmeLoopbackPort()))
 		if err != nil {
 			return nil, fmt.Errorf("could not listen on 127.0.0.1:%d: %v", acmeLoopbackPort(), err)
@@ -290,16 +315,16 @@ func runIssue(cfg *Config, req issueRequest) error {
 	var plan sslPlan
 	switch method {
 	case "auto":
-		plan = planHTTP(domain)
+		plan = planHTTP(cfg.DataDir, domain)
 	case methodDNSCloudflare:
 		plan = sslPlan{Method: methodDNSCloudflare, Why: []string{
 			"Using DNS: LoadInMe adds a TXT record through the Cloudflare API, waits until it is",
 			"visible, and removes it afterwards. Port 80 is not needed.",
 		}}
-	case methodStandalone, methodNginx, methodNginxExisting:
+	case methodStandalone, methodNginx, methodNginxExisting, methodApacheExisting, methodSelf80:
 		plan = sslPlan{Method: method, Why: []string{"Using the method you chose: " + methodLabel(method) + "."}}
 	case methodStopService:
-		plan = planHTTP(domain)
+		plan = planHTTP(cfg.DataDir, domain)
 		if plan.Method == planNginxConflict || plan.Method == methodNginx || plan.Method == methodNginxExisting {
 			unit := plan.Owner.Unit
 			if unit == "" {
@@ -382,6 +407,7 @@ func runIssue(cfg *Config, req issueRequest) error {
 		return err
 	}
 	fmt.Fprintln(out, "✓ HTTPS is on:", webAddressFor(*cfg))
+	reloadFrontAfterCert(*cfg, out)
 
 	// 5. Automatic renewal.
 	ensureRenewTimer(cfg.DataDir, out)
@@ -437,19 +463,20 @@ func runAsRoot(args ...string) error {
 
 // planForRenewal turns the saved method back into a plan. It never
 // asks anything: it runs from the timer.
-func planForRenewal(ri renewalInfo, out io.Writer) (sslPlan, error) {
+func planForRenewal(dataDir string, ri renewalInfo, out io.Writer) (sslPlan, error) {
 	switch ri.Method {
 	case methodDNSCloudflare:
 		return sslPlan{Method: methodDNSCloudflare}, nil
 	case methodStopService:
 		return sslPlan{Method: methodStopService, Unit: ri.Unit}, nil
-	case methodStandalone, methodNginx, methodNginxExisting:
+	case methodStandalone, methodNginx, methodNginxExisting, methodSelf80, methodApacheExisting:
 		// Re-detect: the server may have changed since (nginx
-		// installed, a block added), but never pause a service
-		// unattended unless that was the saved choice.
-		p := planHTTP(ri.Domain)
+		// installed, a block added, LoadInMe now on port 80 itself),
+		// but never pause a service unattended unless that was the
+		// saved choice.
+		p := planHTTP(dataDir, ri.Domain)
 		switch p.Method {
-		case methodStandalone, methodNginx, methodNginxExisting:
+		case methodStandalone, methodNginx, methodNginxExisting, methodSelf80, methodApacheExisting:
 			return p, nil
 		}
 		if ri.Method == methodStandalone && p.Method == methodStopService {
@@ -484,7 +511,7 @@ func runRenew(cfg *Config, force bool, out io.Writer) error {
 			return nil
 		}
 	}
-	plan, err := planForRenewal(ri, out)
+	plan, err := planForRenewal(cfg.DataDir, ri, out)
 	if err != nil {
 		return err
 	}
@@ -511,7 +538,13 @@ func runRenew(cfg *Config, force bool, out io.Writer) error {
 		cfg.CertFile, cfg.KeyFile = certPath, keyPath
 		_ = saveConfig(*cfg)
 	}
-	fmt.Fprintf(out, "✓ Renewed: valid until %s. The web UI picks it up within a minute — no restart needed.\n", cert.NotAfter.Format("2006-01-02"))
+	if cfg.proxied() {
+		fmt.Fprintf(out, "✓ Renewed: valid until %s.\n", cert.NotAfter.Format("2006-01-02"))
+	} else {
+		fmt.Fprintf(out, "✓ Renewed: valid until %s. The web UI picks it up within a minute — no restart needed.\n", cert.NotAfter.Format("2006-01-02"))
+	}
+	// nginx and Apache read the certificate only at (re)load.
+	reloadFrontAfterCert(*cfg, out)
 	return nil
 }
 
@@ -548,6 +581,7 @@ func printSSLStatus(cfg Config, out io.Writer) {
 			fmt.Fprintln(out, "Method: ", label)
 		}
 	}
+	printExposeStatus(cfg, out)
 	switch {
 	case renewTimerActive():
 		fmt.Fprintln(out, "Renewal: automatic — loadinme-renew.timer is active (checks twice a day)")
@@ -566,7 +600,12 @@ func printSSLStatus(cfg Config, out io.Writer) {
 
 // sslOff turns HTTPS off; with removeFiles it also deletes LoadInMe's
 // certificate files for the domain.
-func sslOff(cfg *Config, removeFiles bool, out io.Writer) {
+func sslOff(cfg *Config, removeFiles bool, out io.Writer) bool {
+	if cfg.Expose != nil {
+		fmt.Fprintln(out, "LoadInMe is reachable at https://"+cfg.Domain+" with no port ("+exposeLabel(cfg.Expose.Method)+").")
+		fmt.Fprintln(out, "Remove that first (menu 6 → 6, or: loadinme ssl unexpose), then turn SSL off. Nothing changed.")
+		return false
+	}
 	wasOn := cfg.TLSEnabled
 	cfg.TLSEnabled = false
 	if removeFiles && cfg.Domain != "" && !isLegacyCert(*cfg) {
@@ -585,6 +624,7 @@ func sslOff(cfg *Config, removeFiles bool, out io.Writer) {
 	} else {
 		fmt.Fprintln(out, "SSL was already off.")
 	}
+	return true
 }
 
 // restartWebUIAfterSSL restarts the web UI when it runs (or starts it

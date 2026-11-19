@@ -15,7 +15,8 @@ import (
 //	1 Get SSL (domain → email → strategy picked automatically → issue →
 //	  HTTPS on → web UI restarted)
 //	2 SSL status   3 Renew now   4 Turn SSL off / remove certificate
-//	5 Clear saved domain   0 Back (no extra "Press Enter")
+//	5 Clear saved domain   6 Address without port (v0.8.0)
+//	0 Back (no extra "Press Enter")
 func domainSSLMenu(cfg *Config, scanner *bufio.Scanner) {
 	for {
 		fmt.Println("  Domain & SSL")
@@ -37,9 +38,10 @@ func domainSSLMenu(cfg *Config, scanner *bufio.Scanner) {
 		fmt.Println("  3  Renew now")
 		fmt.Println("  4  Turn SSL off / remove certificate")
 		fmt.Println("  5  Clear saved domain")
+		fmt.Println("  6  Address without port (https://" + domainOr(cfg.Domain, "your-domain") + ")")
 		fmt.Println("  0  Back to main menu")
 		fmt.Println()
-		fmt.Print("  Choose [0-5]: ")
+		fmt.Print("  Choose [0-6]: ")
 		if !scanner.Scan() {
 			return
 		}
@@ -56,10 +58,12 @@ func domainSSLMenu(cfg *Config, scanner *bufio.Scanner) {
 			menuSSLOff(cfg, scanner)
 		case "5":
 			clearSavedDomain(cfg)
+		case "6":
+			menuExposeAddress(cfg, scanner)
 		case "0":
 			return
 		default:
-			fmt.Println("Please choose 0-5.")
+			fmt.Println("Please choose 0-6.")
 		}
 		fmt.Println()
 	}
@@ -161,6 +165,147 @@ func menuGetSSL(cfg *Config, scanner *bufio.Scanner) {
 	}
 	fmt.Println()
 	restartWebUIAfterSSL(*cfg, os.Stdout)
+	// Offer the address without port right away.
+	if cfg.Expose == nil && cfg.TLSEnabled && cfg.Port != httpsPort() {
+		fmt.Println()
+		fmt.Println("Next: make it reachable at https://" + cfg.Domain + " with no port? LoadInMe checks who uses")
+		fmt.Println("port 443 and picks the way; it asks before changing another web server's config.")
+		ans, cancelled := promptCancel(scanner, "Set up the address without port now? (y/n)", "y")
+		if cancelled {
+			fmt.Println("Skipped — it is in this menu as 6 any time.")
+			return
+		}
+		if a := strings.ToLower(ans); a == "y" || a == "yes" {
+			fmt.Println()
+			menuRunExpose(cfg, scanner)
+		} else {
+			fmt.Println("Skipped — it is in this menu as 6 any time.")
+		}
+	}
+}
+
+func domainOr(d, def string) string {
+	if d == "" {
+		return def
+	}
+	return d
+}
+
+// menuExposeAddress is submenu 6: Address without port.
+func menuExposeAddress(cfg *Config, scanner *bufio.Scanner) {
+	fmt.Println("  Address without port")
+	if cfg.Expose != nil {
+		fmt.Println("  Now: https://" + cfg.Domain + " — " + exposeLabel(cfg.Expose.Method))
+		if cfg.proxied() {
+			fmt.Printf("       LoadInMe listens on 127.0.0.1:%d behind %s\n", cfg.Port, frontName(cfg.Expose.Method))
+		}
+		fmt.Println("  1  Check that it answers")
+		fmt.Printf("  2  Undo — back to https://%s:%d\n", cfg.Domain, cfg.Port)
+		fmt.Println("  0  Back")
+		fmt.Println()
+		fmt.Print("  Choose [0-2]: ")
+		if !scanner.Scan() {
+			return
+		}
+		fmt.Println()
+		switch strings.TrimSpace(scanner.Text()) {
+		case "1":
+			if err := verifyExposed(*cfg, 5*time.Second); err != nil {
+				fmt.Println("⚠ https://"+cfg.Domain+" does not answer on this server:", err)
+				if !isServiceRunning(*cfg) {
+					fmt.Println("  The web UI is stopped — start it with option 1 of the main menu.")
+				}
+			} else {
+				fmt.Println("✓ https://" + cfg.Domain + " answers on this server (port " + fmt.Sprint(httpsPort()) + ").")
+			}
+		case "2":
+			ans, cancelled := promptCancel(scanner, "Remove the address without port? (y/n)", "y")
+			if cancelled {
+				fmt.Println("Cancelled.")
+				return
+			}
+			if a := strings.ToLower(ans); a != "y" && a != "yes" {
+				fmt.Println("Nothing changed.")
+				return
+			}
+			menuRunUnexpose(cfg)
+		case "0", "":
+		default:
+			fmt.Println("Please choose 0-2.")
+		}
+		return
+	}
+	if cfg.Domain == "" || !cfg.TLSEnabled {
+		fmt.Println("  First get SSL for your domain (1 Get SSL) — then LoadInMe can drop the port.")
+		return
+	}
+	fmt.Println("  Now: " + webAddressFor(*cfg) + " (with a port)")
+	fmt.Println("  1  Set it up (LoadInMe looks at who uses port 443 and picks the way)")
+	fmt.Println("  0  Back")
+	fmt.Println()
+	fmt.Print("  Choose [0-1]: ")
+	if !scanner.Scan() {
+		return
+	}
+	fmt.Println()
+	switch strings.TrimSpace(scanner.Text()) {
+	case "1":
+		menuRunExpose(cfg, scanner)
+	case "0", "":
+	default:
+		fmt.Println("Please choose 0-1.")
+	}
+}
+
+// menuRunExpose runs the expose step (through sudo when needed) and
+// restarts the web UI.
+func menuRunExpose(cfg *Config, scanner *bufio.Scanner) {
+	var err error
+	if isRoot() {
+		err = runExpose(cfg, exposeRequest{In: scanner, Out: os.Stdout})
+	} else {
+		fmt.Println("This step needs root (ports 443/80, or another web server's config), so it runs")
+		fmt.Println("through sudo — you may be asked for your password.")
+		fmt.Println()
+		if rerr := runAsRoot("ssl", "expose", "--data-dir", cfg.DataDir, "--no-restart"); rerr != nil {
+			fmt.Println("Not set up (see above).")
+		}
+		reloadConfigFromDisk(cfg)
+	}
+	switch {
+	case err == nil, errors.Is(err, errNoChange):
+	case errors.Is(err, errCancelled):
+		fmt.Println("Cancelled.")
+	case errors.Is(err, errNeedRoot):
+		fmt.Println("This needs root. Run the menu with sudo (sudo loadinme menu), or: sudo loadinme ssl expose")
+	default:
+		fmt.Println("Could not set it up:", err)
+	}
+	if cfg.Expose != nil {
+		finishExpose(*cfg, os.Stdout)
+	}
+}
+
+func menuRunUnexpose(cfg *Config) {
+	var err error
+	if isRoot() || !cfg.Expose.undoNeedsRoot() {
+		err = runUnexpose(cfg, os.Stdout)
+	} else {
+		fmt.Println("Undoing needs root (it removes the web server config / port permission), so it runs")
+		fmt.Println("through sudo — you may be asked for your password.")
+		if rerr := runAsRoot("ssl", "unexpose", "--data-dir", cfg.DataDir, "--no-restart"); rerr != nil {
+			fmt.Println("Could not undo it (see above).")
+		}
+		reloadConfigFromDisk(cfg)
+	}
+	if err != nil {
+		fmt.Println("Could not undo it:", err)
+		return
+	}
+	if cfg.Expose == nil {
+		fmt.Println()
+		restartWebUIAfterSSL(*cfg, os.Stdout)
+	}
 }
 
 // menuCloudflareToken makes sure a working Cloudflare token is saved.
@@ -231,6 +376,10 @@ func menuSSLOff(cfg *Config, scanner *bufio.Scanner) {
 		fmt.Println("SSL is already off and there is no certificate.")
 		return
 	}
+	if cfg.Expose != nil {
+		sslOff(cfg, false, os.Stdout) // explains, changes nothing
+		return
+	}
 	ans, cancelled := promptCancel(scanner, "Turn SSL off? (y/n)", "y")
 	if cancelled {
 		fmt.Println("Cancelled.")
@@ -251,7 +400,9 @@ func menuSSLOff(cfg *Config, scanner *bufio.Scanner) {
 		remove = a == "y" || a == "yes"
 	}
 	wasRunning := isServiceRunning(*cfg)
-	sslOff(cfg, remove, os.Stdout)
+	if !sslOff(cfg, remove, os.Stdout) {
+		return
+	}
 	if wasRunning {
 		restartWebUIAfterSSL(*cfg, os.Stdout)
 	} else {

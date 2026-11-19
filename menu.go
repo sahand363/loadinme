@@ -27,12 +27,18 @@ import (
 // Menu:
 //   1 Start   2 Stop   3 Restart   4 Status   5 Change port
 //   6 Domain & SSL (1 Get SSL, 2 SSL status, 3 Renew now,
-//     4 Turn SSL off / remove certificate, 5 Clear saved domain)
+//     4 Turn SSL off / remove certificate, 5 Clear saved domain,
+//     6 Address without port)
 //   7 Update
 //   8 Reset / change username & password   9 View settings
 //   10 Show web UI link   11 Uninstall   0 Exit (silent, no farewell)
 
 func webAddressFor(cfg Config) string {
+	// Address without port (v0.8.0): LoadInMe on 443 itself, or
+	// behind nginx / Apache / Caddy.
+	if cfg.Domain != "" && cfg.Expose != nil {
+		return "https://" + cfg.Domain
+	}
 	if cfg.Domain != "" {
 		if cfg.TLSEnabled {
 			// HTTPS serves on the chosen port, not on 443 (unless
@@ -80,7 +86,9 @@ func printMenuHeader(cfg Config) {
 	} else {
 		fmt.Println("  Status: web UI is stopped  ·  choose 1 to start it")
 	}
-	if cfg.TLSEnabled {
+	if cfg.TLSEnabled && cfg.Expose != nil {
+		fmt.Println("  SSL: on  ·  no port needed (" + exposeLabel(cfg.Expose.Method) + ")")
+	} else if cfg.TLSEnabled {
 		fmt.Println("  SSL: on")
 	} else if cfg.Domain != "" {
 		fmt.Println("  SSL: off  ·  domain:", cfg.Domain)
@@ -511,6 +519,11 @@ func clearSavedDomain(cfg *Config) {
 		fmt.Println("No saved domain to clear.")
 		return
 	}
+	if cfg.Expose != nil {
+		fmt.Println("LoadInMe is reachable at https://" + cfg.Domain + " with no port (" + exposeLabel(cfg.Expose.Method) + ").")
+		fmt.Println("Remove that first (6 → 6), then clear the domain. Nothing changed.")
+		return
+	}
 	domain := cfg.Domain
 	wasTLS := cfg.TLSEnabled
 	cfg.Domain = ""
@@ -600,6 +613,11 @@ func selfUpdate(cfg Config) error {
 		return fmt.Errorf("could not replace %s (do you have write permission there?): %w", exe, err)
 	}
 	newVersion := strings.TrimSpace(versionString(exe))
+	// A replaced file loses its capabilities: give the new binary
+	// the port 443/80 permission again before it starts.
+	if cfg.Expose != nil && cfg.Expose.Setcap {
+		reapplySetcap(exe, os.Stdout)
+	}
 	if wasRunning {
 		if err := startService(cfg); err != nil {
 			return fmt.Errorf("updated to %s, but the web UI could not be restarted: %v (start it with option 1)", newVersion, err)
@@ -656,16 +674,21 @@ func uninstall(cfg Config, scanner *bufio.Scanner) bool {
 	_ = stopService(cfg)
 	// Root-owned pieces from Get SSL: the renewal timer and any
 	// leftover nginx snippet.
-	if systemPiecesPresent() {
+	if systemPiecesPresent() || exposePiecesPresent(cfg) {
 		if isRoot() {
 			removeSystemPieces(os.Stdout)
+			removeExposePieces(&cfg, os.Stdout)
 		} else {
-			fmt.Println("Removing the SSL renewal timer / nginx snippet needs root — asking sudo…")
-			if err := runAsRoot("ssl", "cleanup-system"); err != nil {
+			fmt.Println("Removing the SSL renewal timer / web server snippets needs root — asking sudo…")
+			if err := runAsRoot("ssl", "cleanup-system", "--data-dir", cfg.DataDir); err != nil {
 				fmt.Println("Could not remove them:", err)
-				fmt.Println("Run: sudo systemctl disable --now loadinme-renew.timer; sudo rm -f /etc/systemd/system/loadinme-renew.* /etc/nginx/conf.d/loadinme-acme-*.conf")
+				fmt.Println("Run: sudo systemctl disable --now loadinme-renew.timer; sudo rm -f /etc/systemd/system/loadinme-renew.* /etc/nginx/conf.d/loadinme-*.conf /etc/apache2/sites-*/loadinme-*.conf")
 			}
 		}
+	} else if cfg.Expose != nil {
+		// Nothing root-owned to remove, but the saved address mode
+		// (127.0.0.1) must not outlive the uninstall.
+		removeExposePieces(&cfg, os.Stdout)
 	}
 	if hasSystemdUser() {
 		_ = userSystemctl("disable", "--now", "loadinme.service").Run()
@@ -778,6 +801,9 @@ func runMenu(cfg *Config) {
 			pause(scanner)
 		case "4":
 			fmt.Println("Web UI address:", webAddressFor(*cfg))
+			if cfg.Expose != nil {
+				fmt.Println("Address without port:", exposeLabel(cfg.Expose.Method))
+			}
 			fmt.Println("Running:", isServiceRunning(*cfg))
 			fmt.Println("Port:", cfg.Port)
 			fmt.Println("Domain:", cfg.Domain)
@@ -797,6 +823,12 @@ func runMenu(cfg *Config) {
 			}
 			pause(scanner)
 		case "5":
+			if cfg.proxied() {
+				fmt.Println("LoadInMe is behind " + frontName(cfg.Expose.Method) + " (https://" + cfg.Domain + "), which forwards to port " + strconv.Itoa(cfg.Port) + ".")
+				fmt.Println("Undo the address without port first (6 → 6), change the port, then set it up again.")
+				pause(scanner)
+				continue
+			}
 			portStr, cancelled := promptCancel(scanner, "Web port", strconv.Itoa(cfg.Port))
 			if cancelled {
 				fmt.Println("Cancelled.")
@@ -879,7 +911,9 @@ func runMenu(cfg *Config) {
 			pause(scanner)
 		case "10":
 			fmt.Println("Web UI:", webAddressFor(*cfg))
-			if cfg.TLSEnabled {
+			if cfg.proxied() {
+				fmt.Println("Local:  http://127.0.0.1:" + strconv.Itoa(cfg.Port) + "  (plain http, only for " + frontName(cfg.Expose.Method) + " on this server)")
+			} else if cfg.TLSEnabled {
 				fmt.Println("Local:  https://localhost:" + strconv.Itoa(cfg.Port) + "  (the certificate is for " + cfg.Domain + ")")
 			} else {
 				fmt.Println("Local:  http://localhost:" + strconv.Itoa(cfg.Port))

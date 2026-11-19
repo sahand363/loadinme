@@ -127,6 +127,22 @@ echo ""
 echo "Installed: $INSTALL_DIR/loadinme"
 BIN="$INSTALL_DIR/loadinme"
 
+# --- Address without port (v0.8.0): port 443/80 permission ---
+# When LoadInMe serves https://<domain> on port 443 itself and runs as
+# a normal user, its binary carries cap_net_bind_service (setcap).
+# Replacing the file drops that, so grant it again BEFORE the web UI
+# starts — otherwise the new version could not listen on 443/80.
+if [ -f "$DATA_DIR/config.json" ] && grep -q '"setcap"[[:space:]]*:[[:space:]]*true' "$DATA_DIR/config.json" 2>/dev/null; then
+  echo "Giving the new binary permission to use ports 443/80 again (setcap)…"
+  if [ "$(id -u)" = 0 ]; then
+    setcap cap_net_bind_service=+ep "$BIN" || echo "WARNING: setcap failed — run: sudo setcap cap_net_bind_service=+ep $BIN" >&2
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo setcap cap_net_bind_service=+ep "$BIN" || echo "WARNING: setcap failed — run: sudo setcap cap_net_bind_service=+ep $BIN" >&2
+  else
+    echo "WARNING: no sudo — run as root: setcap cap_net_bind_service=+ep $BIN" >&2
+  fi
+fi
+
 # --- Restart the web UI with the new version (default port 8080) ---
 # A port already saved in <data-dir>/config.json wins over the default.
 # The UI is ALWAYS restarted after an install/update, so the new

@@ -816,7 +816,7 @@ func TestMenuSSLStatusAndOff(t *testing.T) {
 	_ = writeRenewalInfo(dataDir, renewalInfo{Domain: "demo.example.com", Email: "a@b.c", Method: methodNginx})
 	// 6, 2 = status, 4 = off, y, y = delete files, 0 = back, 0 = exit.
 	out := runMenuInput(t, bin, dataDir, port, "6\n2\n4\ny\ny\n0\n0\n", "LOADINME_SYSTEMD_DIR="+t.TempDir())
-	for _, want := range []string{"Choose [0-5]", "Expires:", "days left", "HTTP through nginx", "Renewal:", "SSL is off", "Deleted the certificate files"} {
+	for _, want := range []string{"Choose [0-6]", "Expires:", "days left", "HTTP through nginx", "Renewal:", "SSL is off", "Deleted the certificate files"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("menu output lacks %q:\n%s", want, out)
 		}

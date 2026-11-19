@@ -93,14 +93,14 @@ func serve(store *Store, cfg Config) error {
 	defer close(stop)
 	go store.StartSweeper(stop)
 
-	addr := fmt.Sprintf(":%d", cfg.Port)
+	handler := newRouter(store, cfg)
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      newRouter(store, cfg),
+		Addr:         cfg.listenAddr(),
+		Handler:      handler,
 		ReadTimeout:  15 * time.Minute, // large uploads need a long read window
 		WriteTimeout: 15 * time.Minute,
 	}
-	if cfg.TLSEnabled && cfg.CertFile != "" && cfg.KeyFile != "" {
+	if cfg.servesTLS() {
 		// The certificate is served through GetCertificate, which
 		// re-reads the files when they change (checked at most once
 		// a minute), so a renewal applies without a restart.
@@ -118,15 +118,26 @@ func serve(store *Store, cfg Config) error {
 			GetCertificate: reloader.GetCertificate,
 		}
 		fmt.Printf("LoadInMe — Web UI: https://%s\n", webAddressHost(cfg))
-		fmt.Printf("Serving on :%d (HTTPS, %s)\n", cfg.Port, cfg.Domain)
+		if cfg.Expose != nil && cfg.Expose.Method == exposeDirect {
+			startDirectListeners(cfg, handler, srv.TLSConfig)
+		}
+		fmt.Printf("Serving on %s (HTTPS, %s)\n", cfg.listenAddr(), cfg.Domain)
 		return srv.ListenAndServeTLS("", "")
 	}
+	if cfg.proxied() {
+		fmt.Printf("LoadInMe — Web UI: https://%s (through %s)\n", cfg.Domain, frontName(cfg.Expose.Method))
+		fmt.Printf("Serving plain http on %s for %s only\n", cfg.listenAddr(), frontName(cfg.Expose.Method))
+		return srv.ListenAndServe()
+	}
 	fmt.Printf("LoadInMe — Web UI: http://%s\n", webAddressHost(cfg))
-	fmt.Printf("Serving on :%d — open the address above in your browser (log in first)\n", cfg.Port)
+	fmt.Printf("Serving on %s — open the address above in your browser (log in first)\n", cfg.listenAddr())
 	return srv.ListenAndServe()
 }
 
 func webAddressHost(cfg Config) string {
+	if cfg.Domain != "" && cfg.Expose != nil {
+		return cfg.Domain
+	}
 	if cfg.Domain != "" {
 		if cfg.TLSEnabled {
 			// Same rule as webAddressFor: HTTPS serves on the

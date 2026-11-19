@@ -18,6 +18,13 @@ type Config struct {
 	TLSEnabled bool   `json:"tlsEnabled"`
 	CertFile   string `json:"certFile"`
 	KeyFile    string `json:"keyFile"`
+	// BindAddress is the address the web UI listens on: "" means
+	// every interface; "127.0.0.1" when a web server in front of
+	// LoadInMe (nginx, Apache, Caddy) serves https://<domain>.
+	BindAddress string `json:"bindAddress,omitempty"`
+	// Expose is set when LoadInMe is reachable at https://<domain>
+	// with no port (v0.8.0, menu 6 → 6 / loadinme ssl expose).
+	Expose *ExposeInfo `json:"expose,omitempty"`
 }
 
 const defaultPort = 8080

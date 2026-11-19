@@ -207,6 +207,13 @@ func (cs *challengeServer) set(token, keyAuth string) {
 	cs.mu.Unlock()
 }
 
+// http01Responder makes a key authorization available at
+// /.well-known/acme-challenge/<token>: the in-memory challengeServer,
+// or a challengeDir that LoadInMe's own running :80 listener serves.
+type http01Responder interface {
+	set(token, keyAuth string)
+}
+
 func (cs *challengeServer) port() int { return cs.ln.Addr().(*net.TCPAddr).Port }
 
 func (cs *challengeServer) Close() {
@@ -273,7 +280,7 @@ type issueOptions struct {
 	Domain  string
 	Email   string
 	// Exactly one of HTTP / DNS is set.
-	HTTP      *challengeServer
+	HTTP      http01Responder
 	SelfCheck bool // run selfCheckHTTP01 before telling the CA to validate
 	DNS       dnsSolver
 	Out       io.Writer

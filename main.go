@@ -12,6 +12,7 @@
 //	loadinme set-password [username]
 //	loadinme reset-password [username]   # alias of set-password
 //	loadinme ssl issue|renew|status|off  # built-in Let's Encrypt (ACME)
+//	loadinme ssl expose|unexpose         # https://<domain> with no port
 //	loadinme version
 //	loadinme --help
 package main
@@ -24,7 +25,7 @@ import (
 	"strconv"
 )
 
-const version = "0.7.0"
+const version = "0.8.0"
 
 func usage() {
 	fmt.Printf(`LoadInMe %s — file & text sharing for your VPS
@@ -39,6 +40,7 @@ Usage:
          # the login without asking for the old password, and logs
          # out every browser/device
   loadinme ssl issue|renew|status|off [--data-dir DIR]   # see: loadinme ssl --help
+  loadinme ssl expose|unexpose [--data-dir DIR]   # https://DOMAIN with no port
   loadinme version
   loadinme --help
 

@@ -21,9 +21,56 @@ protects the whole thing.
   fresh install. Change the login later in Settings or from the SSH menu.
 - **SSL** — LoadInMe gets its own Let's Encrypt certificate (no certbot),
   works next to nginx on port 80, and renews it by itself.
+- **No port in the address** — after SSL, LoadInMe can be reachable at
+  plain `https://your-domain`: on port 443 itself, or behind the nginx,
+  Apache or Caddy you already run. It never touches anything else on 443.
 - **Light** — one static Go binary, no database server. Metadata lives in
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
+
+## v0.8.0
+
+- **Address without port** — after Get SSL, LoadInMe can make itself
+  reachable at `https://your-domain` with no `:5234` on the end. Like
+  Get SSL does for port 80, it looks at who owns port 443 (and 80) on
+  your server, picks the way that fits, and tells you which one and why:
+
+  | Who has port 443 | What LoadInMe does |
+  |---|---|
+  | nobody (free) | serves HTTPS on 443 itself (your own port keeps working too), plus a small port-80 listener that sends `http://` to `https://` and answers Let's Encrypt renewals — nothing pauses |
+  | nginx | adds one file, `/etc/nginx/conf.d/loadinme-<domain>.conf` (443 with LoadInMe's certificate → `127.0.0.1:<port>`, plus a port-80 redirect if no other site claims the domain there), runs `nginx -t`, reloads, and rolls back on any error |
+  | Apache | the same as a vhost (`sites-available` + `sites-enabled`, or `conf.d`), enabling mod_proxy / proxy_http / ssl / headers if needed, `configtest`, graceful reload |
+  | Caddy | appends `<domain> { reverse_proxy 127.0.0.1:<port> }` to its Caddyfile and reloads (Caddy brings its own certificate) |
+  | anything else — Docker, xray / x-ui, HAProxy, unknown | **touches nothing**: you stay at `https://your-domain:<port>`, and the menu says why and what you could do |
+
+  It always asks before changing another web server's config. If your
+  web server already has its own block for the domain on 443, LoadInMe
+  does not overwrite it: it prints the `location /` block to paste in,
+  and then only moves itself to `127.0.0.1`.
+- **Behind a web server, LoadInMe listens on 127.0.0.1 only** (new
+  `bindAddress` setting) and speaks plain http to it; the login cookie
+  is still marked Secure, because it trusts `X-Forwarded-Proto` from
+  loopback only. Uploads are not capped by the web server
+  (`client_max_body_size 0` / `LimitRequestBody 0`, no request
+  buffering): LoadInMe's own max file size applies.
+- **Renewals keep working in every mode** — when LoadInMe itself holds
+  port 80, `loadinme ssl renew` writes the challenge into
+  `~/.loadinme/acme-challenge/` and the running web UI answers it (no
+  second bind, nothing stops). Behind nginx or Apache, LoadInMe's
+  port-80 block forwards the check, and the web server is reloaded after
+  every renewal so it serves the new certificate.
+- **Port 443 without root** — when LoadInMe runs as a normal user, its
+  binary gets `cap_net_bind_service` (setcap, through sudo). The
+  installer and the menu's Update grant it again after replacing the
+  file; undo removes it. Running as root needs none of this.
+- **Menu 6 → 6 "Address without port"** — set it up, see the current
+  method, check that it answers, or undo it. Get SSL offers it as the
+  last step. New commands: `loadinme ssl expose` and
+  `loadinme ssl unexpose`. Undo removes the snippet (or the Caddy
+  block), restores the bind address, removes setcap, and puts the
+  address back to `https://your-domain:<port>`. Your saved port never
+  changes. SSL status shows the method and the final address;
+  Uninstall removes everything LoadInMe added to other configs.
 
 ## v0.7.0
 
@@ -217,12 +264,12 @@ Run `loadinme menu`. The web UI link is printed first, then:
 | 3 | Restart web UI |
 | 4 | Status (address, port, limits, item count) |
 | 5 | Change port |
-| 6 | Domain & SSL (1 Get SSL, 2 SSL status, 3 Renew now, 4 Turn SSL off / remove certificate, 5 Clear saved domain) |
+| 6 | Domain & SSL (1 Get SSL, 2 SSL status, 3 Renew now, 4 Turn SSL off / remove certificate, 5 Clear saved domain, 6 Address without port) |
 | 7 | Update LoadInMe (downloads the latest release binary, then restarts the web UI with it) |
 | 8 | Reset / change username & password (no old password needed; logs out all browsers) |
 | 9 | View settings |
 | 10 | Show web UI link |
-| 11 | Uninstall (asks whether to keep your data; removes the renewal timer) |
+| 11 | Uninstall (asks whether to keep your data; removes the renewal timer and anything added to nginx / Apache / Caddy) |
 | 0 | Exit |
 
 Pressing 0 exits the menu, and typing 0 at any question cancels that
@@ -239,6 +286,10 @@ picks how to prove the domain is yours (see v0.7.0 above), gets the
 certificate, turns HTTPS on and restarts the web UI. The steps that
 need root ask sudo for your password; `sudo loadinme menu` works too.
 HTTPS keeps your chosen port (`https://your-domain:2343`).
+
+At the end, Get SSL offers the **address without port** (6 → 6): see
+v0.8.0 above for what it does on your server. Behind nginx or Apache,
+change the port only after undoing it (the menu says so).
 
 Renewal is automatic: `loadinme-renew.timer` runs `loadinme ssl renew`
 twice a day and renews 30 days before expiry; the web UI picks up the
@@ -262,6 +313,8 @@ loadinme ssl issue --domain DOMAIN --email EMAIL [--method auto] [--yes]
 loadinme ssl renew [--force]
 loadinme ssl status
 loadinme ssl off [--remove]
+loadinme ssl expose [--method auto|nginx-manual|apache-manual] [--yes]
+loadinme ssl unexpose
 loadinme version
 loadinme --help
 ```
@@ -282,7 +335,12 @@ v0.1.0 the menu's open database made the daemon fail to start with
 for the HTTP methods); `--method` is `auto` (default), `standalone`,
 `nginx`, `nginx-existing`, `stop-service` or `dns-cloudflare`. `ssl renew`
 renews when fewer than 30 days are left (`--force`: now). `ssl off`
-turns HTTPS off (`--remove` also deletes the certificate files).
+turns HTTPS off (`--remove` also deletes the certificate files; undo
+the address without port first). `ssl expose` sets up the address
+without port (run it with sudo unless 443 is free and LoadInMe runs as
+root); `--method nginx-manual` / `apache-manual` is for when you pasted
+LoadInMe's block into your own server config yourself. `ssl unexpose`
+undoes it.
 
 Environment: `LOADINME_PORT`, `LOADINME_DATA`. For testing against
 another ACME server: `LOADINME_ACME_DIR` (directory URL) and
@@ -303,12 +361,13 @@ or view them from the SSH menu (option 9).
 
 ```
 ~/.loadinme/
-  config.json     # port, domain, SSL
+  config.json     # port, domain, SSL, bind address, address without port
   loadinme.db     # items, clips, settings, users, sessions
   uploads/        # uploaded files, stored by item ID
   setup-code      # one-time setup code (only until a login exists)
   acme/           # Let's Encrypt account key, Cloudflare token (0600)
   certs/<domain>/ # fullchain.pem, privkey.pem (0600), renewal.json
+  acme-challenge/ # renewal challenge files while LoadInMe holds port 80
 ```
 
 ## Build from source

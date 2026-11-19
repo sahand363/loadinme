@@ -26,12 +26,19 @@ import (
 //	stop-service    something else owns port 80: its systemd unit is stopped for
 //	                the few seconds of the challenge and always started again
 //	dns-cloudflare  DNS-01 through the Cloudflare API: port 80 not needed at all
+//	loadinme-port80 LoadInMe itself holds port 80 (address without port,
+//	                v0.8.0): its running :80 listener serves the challenge
+//	                files the issuing process writes (nothing pauses)
+//	apache-existing Apache owns port 80 and serves LoadInMe's port-80 vhost,
+//	                which forwards the challenge to 127.0.0.1:41580
 const (
-	methodStandalone    = "standalone"
-	methodNginx         = "nginx"
-	methodNginxExisting = "nginx-existing"
-	methodStopService   = "stop-service"
-	methodDNSCloudflare = "dns-cloudflare"
+	methodSelf80         = "loadinme-port80"
+	methodApacheExisting = "apache-existing"
+	methodStandalone     = "standalone"
+	methodNginx          = "nginx"
+	methodNginxExisting  = "nginx-existing"
+	methodStopService    = "stop-service"
+	methodDNSCloudflare  = "dns-cloudflare"
 	// planNginxConflict is a plan, not a method: nginx already serves
 	// the domain on port 80 and has no challenge line yet.
 	planNginxConflict = "nginx-conflict"
@@ -50,6 +57,10 @@ func methodLabel(m string) string {
 		return "HTTP on port 80 (the service on port 80 pauses for a few seconds)"
 	case methodDNSCloudflare:
 		return "DNS through Cloudflare"
+	case methodSelf80:
+		return "HTTP on port 80 (LoadInMe's own port-80 listener answers, nothing pauses)"
+	case methodApacheExisting:
+		return "HTTP through Apache (LoadInMe's port-80 vhost forwards the check)"
 	case "certbot":
 		return "certbot (old setup, outside LoadInMe)"
 	case planNginxConflict:
@@ -145,11 +156,15 @@ var ssUserRe = regexp.MustCompile(`\(\("([^"]+)",pid=(\d+)`)
 // detectPort80 finds out whether port 80 is free and, if not, which
 // process (and systemd unit) holds it. Without root the PID may be
 // unknown.
-func detectPort80() portOwner {
-	listening, inodes, ok := listeningOn(80)
+func detectPort80() portOwner { return detectPortOwner(80) }
+
+// detectPortOwner is detectPort80 for any TCP port (v0.8.0 uses it
+// for 443 too).
+func detectPortOwner(port int) portOwner {
+	listening, inodes, ok := listeningOn(port)
 	if !ok {
 		// No /proc (not Linux): fall back to a bind test.
-		if portFree(80) {
+		if portFree(port) {
 			return portOwner{Free: true}
 		}
 		return portOwner{}
@@ -159,7 +174,7 @@ func detectPort80() portOwner {
 	}
 	o := portOwner{}
 	// ss -tlnp names the process (root sees every process).
-	if out, err := exec.Command("ss", "-H", "-tlnp", "sport = :80").Output(); err == nil {
+	if out, err := exec.Command("ss", "-H", "-tlnp", "sport = :"+strconv.Itoa(port)).Output(); err == nil {
 		if m := ssUserRe.FindStringSubmatch(string(out)); m != nil {
 			o.Process = m[1]
 			o.PID, _ = strconv.Atoi(m[2])
@@ -241,9 +256,13 @@ type nginxServer struct {
 
 // listensOn80 reports whether the server block takes plain HTTP on
 // port 80 (no listen directive at all means port 80 too).
-func (s nginxServer) listensOn80() bool {
+func (s nginxServer) listensOn80() bool { return s.listensOnPort("80") }
+
+// listensOnPort reports whether the server block listens on port
+// (an address with no port, or no listen directive at all, is 80).
+func (s nginxServer) listensOnPort(want string) bool {
 	if len(s.Listens) == 0 {
-		return true
+		return want == "80"
 	}
 	for _, l := range s.Listens {
 		f := strings.Fields(l)
@@ -263,7 +282,7 @@ func (s nginxServer) listensOn80() bool {
 		} else if _, err := strconv.Atoi(addr); err != nil {
 			port = "80" // an address with no port
 		}
-		if port == "80" {
+		if port == want {
 			return true
 		}
 	}
@@ -415,11 +434,24 @@ func topLevelDirectives(body string) []string {
 // findNginxBlockFor returns the enabled port-80 server block that
 // uses domain as a server_name (skipping LoadInMe's own snippet).
 func findNginxBlockFor(dump, domain string) (nginxServer, bool) {
+	return findNginxBlockOn(dump, domain, "80", "loadinme-acme-")
+}
+
+// findNginxBlockOn returns the enabled server block listening on port
+// with domain as a server_name, skipping files whose name contains
+// any of skip.
+func findNginxBlockOn(dump, domain, port string, skip ...string) (nginxServer, bool) {
 	for _, s := range parseNginxServers(dump) {
-		if strings.Contains(filepath.Base(s.File), "loadinme-acme-") {
+		skipped := false
+		for _, sk := range skip {
+			if strings.Contains(filepath.Base(s.File), sk) {
+				skipped = true
+			}
+		}
+		if skipped {
 			continue
 		}
-		if s.listensOn80() && s.hasName(domain) {
+		if s.listensOnPort(port) && s.hasName(domain) {
 			return s, true
 		}
 	}
