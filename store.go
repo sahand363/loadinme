@@ -85,6 +85,7 @@ type Store struct {
 	db         *bbolt.DB
 	dataDir    string
 	uploadsDir string
+	limiter    *loginLimiter
 }
 
 func OpenStore(dataDir string) (*Store, error) {
@@ -95,7 +96,10 @@ func OpenStore(dataDir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, dataDir: dataDir, uploadsDir: filepath.Join(dataDir, "uploads")}
+	// A root process (sudo loadinme menu) must not leave the
+	// database or uploads folder owned by root.
+	chownToApp(dataDir, dataDir, filepath.Join(dataDir, "uploads"), filepath.Join(dataDir, "loadinme.db"))
+	s := &Store{db: db, dataDir: dataDir, uploadsDir: filepath.Join(dataDir, "uploads"), limiter: newLoginLimiter()}
 	err = db.Update(func(tx *bbolt.Tx) error {
 		for _, b := range [][]byte{itemsBucket, settingsBucket, userBucket, sessionBucket} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {

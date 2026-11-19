@@ -5,7 +5,7 @@
 # No Go, no clone, no compile on the server.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sahand363/loadinme/main/install.sh | bash
 #
 # After installing, the installer restarts the web UI with the new
 # version (default port 8080) and opens the SSH menu — the web UI link
@@ -17,7 +17,7 @@
 # of hanging.
 #
 # Specific version (a git tag, e.g. v0.4.0):
-#   curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.4.0
+#   curl -fsSL https://raw.githubusercontent.com/sahand363/loadinme/main/install.sh | bash -s -- --version v0.4.0
 #   VERSION=v0.4.0 bash install.sh
 #
 # Flags: --version TAG | --install-dir DIR | --no-menu | --no-web
@@ -31,7 +31,7 @@
 #   LOCAL_BINARY - dev/test only: install this local file instead of downloading
 set -euo pipefail
 
-REPO="sahfar363/loadinme"
+REPO="sahand363/loadinme"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${VERSION:-}"
 DATA_DIR="${LOADINME_DATA:-$HOME/.loadinme}"
@@ -157,23 +157,29 @@ if [ -f "$DATA_DIR/config.json" ]; then
   PORT="$(saved_port "$DATA_DIR/config.json")"
 fi
 LOG="$DATA_DIR/loadinme.log"
+# health answers whether the web UI is up on $PORT — over http, or
+# over https when SSL is on (self-check of our own server, so -k).
+health() {
+  curl -fsS --max-time "${1:-2}" "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 ||
+    curl -fsSk --max-time "${1:-2}" "https://127.0.0.1:$PORT/health" >/dev/null 2>&1
+}
 if [ -z "${LOADINME_NO_WEB:-}" ]; then
   OLD_RUNNING=0
-  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  if health 2; then
     OLD_RUNNING=1
     echo "Web UI is running — restarting it with the new version…"
     "$BIN" stop --data-dir "$DATA_DIR" >/dev/null 2>&1 || true
     # Wait until the old process is really gone (up to ~5s).
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-      curl -fsS --max-time 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || break
+      health 1 || break
       sleep 0.5
     done
   fi
-  if [ "$OLD_RUNNING" = 1 ] && curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  if [ "$OLD_RUNNING" = 1 ] && health 2; then
     echo "WARNING: the old web UI is still running — the update may not have applied." >&2
     echo "Stop it by hand (loadinme stop) and start it again (loadinme start)." >&2
   elif "$BIN" start --port "$PORT" --data-dir "$DATA_DIR"; then
-    if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    if health 2; then
       if [ "$OLD_RUNNING" = 1 ]; then
         echo "Web UI restarted on port $PORT ($("$BIN" version))."
       else
@@ -189,9 +195,18 @@ if [ -z "${LOADINME_NO_WEB:-}" ]; then
   fi
 fi
 echo ""
-echo "Open the web UI in your browser and create your login on the setup page."
-echo "If the server is remote, open http://<your-server-IP>:$PORT — the SSH menu below shows the exact link on top."
-echo "No terminal setup needed — everything after this is in the web UI."
+if [ -f "$DATA_DIR/setup-code" ]; then
+  # A fresh install: the setup page asks for this one-time code, so a
+  # stranger who finds the page first cannot claim the server.
+  echo "Open the web UI in your browser and create your login on the setup page."
+  echo "If the server is remote, open http://<your-server-IP>:$PORT — the SSH menu below shows the exact link on top."
+  echo ""
+  echo "  Setup code: $(cat "$DATA_DIR/setup-code" 2>/dev/null)   (the setup page asks for it once)"
+  echo ""
+  echo "No terminal setup needed — everything after this is in the web UI."
+else
+  echo "Open the web UI in your browser — the SSH menu below shows the exact link on top."
+fi
 echo ""
 
 # --- Open the SSH menu (the web UI link is on top of it) ---

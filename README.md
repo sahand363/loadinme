@@ -16,10 +16,70 @@ protects the whole thing.
 - **Limits** — max 200 items in total, max 100 MB per file. Change both,
   plus the default expiry, in Settings (gear ⚙️ on top).
 - **Login** — first run shows a setup page to create your username and
-  password. Change it later in Settings or from the SSH menu.
+  password (at least 8 characters). The setup page asks for a one-time
+  setup code that only the server shows, so nobody else can claim a
+  fresh install. Change the login later in Settings or from the SSH menu.
+- **SSL** — LoadInMe gets its own Let's Encrypt certificate (no certbot),
+  works next to nginx on port 80, and renews it by itself.
 - **Light** — one static Go binary, no database server. Metadata lives in
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
+
+## v0.7.0
+
+- **SSL rebuilt from scratch — no more certbot** — LoadInMe now gets
+  its Let's Encrypt certificate itself (a built-in ACME client, ECDSA
+  P-256 keys). The certificate lives in `~/.loadinme/certs/<domain>/`,
+  readable only by you (0600) and owned by the user LoadInMe runs as —
+  certbot kept it in `/etc/letsencrypt`, which LoadInMe often was not
+  allowed to read.
+- **Works next to nginx** — Let's Encrypt checks your domain over port
+  80, which nginx usually holds. Get SSL now looks at who owns port 80
+  and picks the right way by itself, and tells you which one and why:
+  - port 80 is free → LoadInMe answers on port 80 itself for the few
+    seconds of the check;
+  - nginx owns port 80 → LoadInMe adds a tiny temporary nginx config
+    for your domain that forwards only `/.well-known/acme-challenge/`
+    to LoadInMe, reloads nginx (no downtime), and removes it right
+    after — also when something fails. If nginx already has a server
+    block for that domain, the menu prints the one line to add to it
+    (`location /.well-known/acme-challenge/ { proxy_pass http://127.0.0.1:41580; }`),
+    or offers to pause nginx for a few seconds instead;
+  - something else owns port 80 → it names the service, asks first,
+    stops it for the few seconds of the check and always starts it
+    again;
+  - port 80 can't be used at all → choose DNS with a Cloudflare API
+    token (saved in `~/.loadinme/acme/`, readable only by you).
+  Before asking Let's Encrypt, it checks that the domain points at
+  this server and says so plainly if it doesn't (a Cloudflare
+  orange-cloud proxy is fine).
+- **Renewals that actually happen** — `loadinme ssl renew` renews 30
+  days before expiry with the same method, and Get SSL sets up a
+  `loadinme-renew.timer` that runs it twice a day. The web UI picks up
+  a renewed certificate by itself within a minute — no restart.
+- **Domain & SSL menu (6) rebuilt** — 1 Get SSL (domain → email → the
+  check is picked for you → certificate → HTTPS on → web UI
+  restarted), 2 SSL status (domain, issuer, expiry, method, is the
+  renewal timer on?), 3 Renew now, 4 Turn SSL off / remove
+  certificate, 5 Clear saved domain. The steps that need root ask sudo
+  for just that step, or run the whole menu with `sudo loadinme menu`
+  (it still uses your own `~/.loadinme` and keeps the web UI running
+  as you). New commands: `loadinme ssl issue|renew|status|off`.
+- **Old certbot setups keep working** — a config that points to
+  `/etc/letsencrypt` still serves HTTPS; the menu suggests re-issuing
+  with 6 → 1 so renewals work.
+- **Safer login** — a fresh install can no longer be claimed by
+  whoever opens `/setup` first: the setup page asks for a one-time
+  setup code that the server prints (installer output, top of
+  `loadinme menu`, `~/.loadinme/setup-code`). After 5 wrong logins
+  from one address, that address waits 1 minute, then 2, 4, … up to 30
+  minutes. New passwords need at least 8 characters (existing ones
+  keep working). The login cookie is marked Secure when HTTPS is on.
+  Uploads are cut off at the max file size (plus a little room) before
+  they are read, so an oversized upload can't fill the disk.
+- **New home** — the project lives at
+  [github.com/sahand363/loadinme](https://github.com/sahand363/loadinme);
+  the installer, the menu's Update and the links all point there.
 
 ## v0.6.2
 
@@ -123,21 +183,23 @@ protects the whole thing.
 ## Install (Ubuntu server, one line)
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sahand363/loadinme/main/install.sh | bash
 ```
 
 No Go, no clone, no compile on the server — GitHub Actions builds the
 binary and the installer just downloads it. The installer then starts
 the web UI by itself (default port 8080) and opens the SSH menu, with
 the web UI link right on top. Open the link in your browser and create
-your login on the setup page — no terminal setup needed after that.
+your login on the setup page, using the setup code the installer prints
+(it is also on top of `loadinme menu`) — no terminal setup needed after
+that.
 
 If there is no terminal (a scripted install), the installer starts the
 web UI in the background, prints the address, and exits; run
 `loadinme menu` later to open the menu. `LOADINME_NO_MENU=1` skips the
 menu, `LOADINME_NO_WEB=1` skips starting the web UI.
 
-Specific version: `curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash -s -- --version v0.4.0`
+Specific version: `curl -fsSL https://raw.githubusercontent.com/sahand363/loadinme/main/install.sh | bash -s -- --version v0.4.0`
 
 After installing or updating, the installer always restarts the web UI
 with the new version (stopping the old process first if it was
@@ -155,16 +217,33 @@ Run `loadinme menu`. The web UI link is printed first, then:
 | 3 | Restart web UI |
 | 4 | Status (address, port, limits, item count) |
 | 5 | Change port |
-| 6 | Domain & SSL (1 Get SSL, 2 List certificates & revoke one, 3 Clear saved domain) |
+| 6 | Domain & SSL (1 Get SSL, 2 SSL status, 3 Renew now, 4 Turn SSL off / remove certificate, 5 Clear saved domain) |
 | 7 | Update LoadInMe (downloads the latest release binary, then restarts the web UI with it) |
 | 8 | Reset / change username & password (no old password needed; logs out all browsers) |
 | 9 | View settings |
 | 10 | Show web UI link |
-| 11 | Uninstall (asks whether to keep your data) |
+| 11 | Uninstall (asks whether to keep your data; removes the renewal timer) |
 | 0 | Exit |
 
 Pressing 0 exits the menu, and typing 0 at any question cancels that
 step instead of becoming a value.
+
+Until a login exists, the menu header also shows the one-time setup
+code the setup page asks for.
+
+## SSL (menu 6 → 1)
+
+Point an A record for your domain at the server, then run
+`loadinme menu` → 6 → 1 and enter the domain and an email. LoadInMe
+picks how to prove the domain is yours (see v0.7.0 above), gets the
+certificate, turns HTTPS on and restarts the web UI. The steps that
+need root ask sudo for your password; `sudo loadinme menu` works too.
+HTTPS keeps your chosen port (`https://your-domain:2343`).
+
+Renewal is automatic: `loadinme-renew.timer` runs `loadinme ssl renew`
+twice a day and renews 30 days before expiry; the web UI picks up the
+new certificate within a minute. Check it any time with 6 → 2 or
+`loadinme ssl status`.
 
 The menu uses a systemd user service (`loadinme.service`) when
 systemctl is available, and falls back to a background process with a
@@ -179,6 +258,10 @@ loadinme stop [--data-dir ~/.loadinme]
 loadinme menu
 loadinme set-password [username]
 loadinme reset-password [username]
+loadinme ssl issue --domain DOMAIN --email EMAIL [--method auto] [--yes]
+loadinme ssl renew [--force]
+loadinme ssl status
+loadinme ssl off [--remove]
 loadinme version
 loadinme --help
 ```
@@ -195,7 +278,15 @@ v0.1.0 the menu's open database made the daemon fail to start with
 "could not open data store: timeout" while the menu still printed
 "Web UI started".
 
-Environment: `LOADINME_PORT`, `LOADINME_DATA`.
+`ssl issue` gets a certificate and turns HTTPS on (run it with sudo
+for the HTTP methods); `--method` is `auto` (default), `standalone`,
+`nginx`, `nginx-existing`, `stop-service` or `dns-cloudflare`. `ssl renew`
+renews when fewer than 30 days are left (`--force`: now). `ssl off`
+turns HTTPS off (`--remove` also deletes the certificate files).
+
+Environment: `LOADINME_PORT`, `LOADINME_DATA`. For testing against
+another ACME server: `LOADINME_ACME_DIR` (directory URL) and
+`LOADINME_ACME_CA_FILE` (its CA certificate).
 
 ## Settings (defaults)
 
@@ -215,6 +306,9 @@ or view them from the SSH menu (option 9).
   config.json     # port, domain, SSL
   loadinme.db     # items, clips, settings, users, sessions
   uploads/        # uploaded files, stored by item ID
+  setup-code      # one-time setup code (only until a login exists)
+  acme/           # Let's Encrypt account key, Cloudflare token (0600)
+  certs/<domain>/ # fullchain.pem, privkey.pem (0600), renewal.json
 ```
 
 ## Build from source

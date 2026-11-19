@@ -11,6 +11,7 @@
 //	loadinme menu            # SSH menu (web link on top)
 //	loadinme set-password [username]
 //	loadinme reset-password [username]   # alias of set-password
+//	loadinme ssl issue|renew|status|off  # built-in Let's Encrypt (ACME)
 //	loadinme version
 //	loadinme --help
 package main
@@ -23,7 +24,7 @@ import (
 	"strconv"
 )
 
-const version = "0.6.2"
+const version = "0.7.0"
 
 func usage() {
 	fmt.Printf(`LoadInMe %s — file & text sharing for your VPS
@@ -37,6 +38,7 @@ Usage:
   loadinme reset-password [username]   # same as set-password: resets
          # the login without asking for the old password, and logs
          # out every browser/device
+  loadinme ssl issue|renew|status|off [--data-dir DIR]   # see: loadinme ssl --help
   loadinme version
   loadinme --help
 
@@ -56,6 +58,10 @@ limits in the web UI with the gear icon, or from the SSH menu.
 }
 
 func main() {
+	// Tests point the old certbot directory at a temp dir.
+	if d := os.Getenv("LOADINME_LETSENCRYPT_DIR"); d != "" {
+		letsEncryptDir = d
+	}
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "--help", "-h", "help":
@@ -64,6 +70,8 @@ func main() {
 		case "--version", "-v", "version":
 			fmt.Println("loadinme", version)
 			return
+		case "ssl":
+			os.Exit(runSSLCLI(os.Args[2:]))
 		}
 	}
 
@@ -190,8 +198,14 @@ func main() {
 		}
 		has, _ := store.HasUser()
 		if !has {
+			code, err := ensureSetupCode(dataDir)
 			fmt.Println("No login user yet — open the web UI and create one on the setup page,")
+			if err == nil {
+				fmt.Println("using this one-time setup code:", code)
+			}
 			fmt.Println("or run: loadinme set-password")
+		} else {
+			removeSetupCode(dataDir)
 		}
 		if err := serve(store, cfg); err != nil {
 			fmt.Fprintln(os.Stderr, "loadinme:", err)

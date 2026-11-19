@@ -1218,13 +1218,6 @@ func runMenuInput(t *testing.T, bin, dataDir string, port int, input string, ext
 	return buf.String()
 }
 
-// certbotInstalled reports whether certbot is on PATH. The SSL tests
-// that expect the "certbot is not installed" path skip when it is.
-func certbotInstalled() bool {
-	_, err := exec.LookPath("certbot")
-	return err == nil
-}
-
 // writeFakeCertFolder writes a self-signed certificate (and a dummy
 // private key) for domains into <base>/live/<folder>/, the way certbot
 // lays certificates out. folder may differ from the domains the
@@ -1273,100 +1266,6 @@ func writeFakeCert(t *testing.T, base, domain string, notAfter time.Time) time.T
 	return writeFakeCertFolder(t, base, domain, []string{domain}, notAfter)
 }
 
-// Get SSL with certbot absent: the menu must print the
-// certbot-not-installed guidance, change no SSL setting, and return
-// to the menu. (The domain is saved — that is the point of submenu 1
-// — but TLS stays off and no certificate is configured.)
-func TestDomainSSLGetNoCertbot(t *testing.T) {
-	if certbotInstalled() {
-		t.Skip("certbot is installed; this test needs it absent")
-	}
-	bin := buildTestBinary(t)
-	dataDir := t.TempDir()
-	port := freePort(t)
-	// 6 = Domain & SSL, 1 = Get SSL, domain, email, 0 = back to the
-	// main menu, Enter at the pause, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n1\nexample.com\nuser@example.com\n0\n0\n")
-	if !strings.Contains(out, "certbot is not installed") {
-		t.Fatalf("missing certbot guidance:\n%s", out)
-	}
-	if strings.Contains(out, "Bye") {
-		t.Fatalf("menu printed a farewell:\n%s", out)
-	}
-	b, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
-	if err != nil {
-		t.Fatalf("config.json was not written: %v", err)
-	}
-	var cfg Config
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		t.Fatalf("parse config.json: %v", err)
-	}
-	if cfg.Domain != "example.com" {
-		t.Fatalf("saved domain = %q, want example.com", cfg.Domain)
-	}
-	if cfg.TLSEnabled || cfg.CertFile != "" || cfg.KeyFile != "" {
-		t.Fatalf("SSL changed without certbot: TLSEnabled=%v cert=%q key=%q", cfg.TLSEnabled, cfg.CertFile, cfg.KeyFile)
-	}
-}
-
-// List certificates with an empty letsencrypt dir: the submenu must
-// say plainly that none were found (and name the directory it
-// checked), then 0 returns to the main menu and 0 exits silently.
-func TestDomainSSLListNone(t *testing.T) {
-	bin := buildTestBinary(t)
-	dataDir := t.TempDir()
-	port := freePort(t)
-	leDir := t.TempDir() // no live/ inside: no certificates at all
-	// 6 = Domain & SSL, 2 = List & revoke, 0 = back, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n2\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
-	if !strings.Contains(out, "No certificates found") {
-		t.Fatalf("missing 'no certificates' message:\n%s", out)
-	}
-	if !strings.Contains(out, filepath.Join(leDir, "live")) {
-		t.Fatalf("list did not name the directory checked:\n%s", out)
-	}
-	if strings.Contains(out, "Bye") {
-		t.Fatalf("menu printed a farewell:\n%s", out)
-	}
-}
-
-// List a fake self-signed certificate and "revoke" it with certbot
-// absent: the menu must show the certificate with its expiry date,
-// then print the manual revoke commands instead of deleting anything,
-// and leave the config untouched.
-func TestDomainSSLRevokeFakeCertNoCertbot(t *testing.T) {
-	if certbotInstalled() {
-		t.Skip("certbot is installed; this test needs it absent")
-	}
-	bin := buildTestBinary(t)
-	dataDir := t.TempDir()
-	port := freePort(t)
-	leDir := t.TempDir()
-	expiry := writeFakeCert(t, leDir, "example.com", time.Now().Add(90*24*time.Hour))
-	// 6 = Domain & SSL, 2 = List & revoke, domain, y = confirm,
-	// 0 = back, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n2\nexample.com\ny\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
-	if !strings.Contains(out, "example.com") || !strings.Contains(out, "expires "+expiry.Format("2006-01-02")) {
-		t.Fatalf("list did not show the certificate with its expiry:\n%s", out)
-	}
-	if !strings.Contains(out, "certbot is not installed") || !strings.Contains(out, "certbot revoke --cert-path") {
-		t.Fatalf("missing manual revoke commands:\n%s", out)
-	}
-	if strings.Contains(out, "Bye") {
-		t.Fatalf("menu printed a farewell:\n%s", out)
-	}
-	// Nothing was deleted and the config was not touched.
-	if _, err := os.Stat(filepath.Join(leDir, "live", "example.com", "fullchain.pem")); err != nil {
-		t.Fatalf("certificate was deleted without certbot: %v", err)
-	}
-	if b, err := os.ReadFile(filepath.Join(dataDir, "config.json")); err == nil {
-		var cfg Config
-		if err := json.Unmarshal(b, &cfg); err == nil && (cfg.TLSEnabled || cfg.CertFile != "" || cfg.KeyFile != "") {
-			t.Fatalf("revoke changed the config without certbot: %+v", cfg)
-		}
-	}
-}
-
 // Submenu 0 returns to the main menu (it must NOT exit the app):
 // after 6 then 0, the main menu is printed again, and a second 0
 // exits silently with no farewell.
@@ -1391,116 +1290,9 @@ func TestDomainSSLSubmenuBackToMain(t *testing.T) {
 	}
 }
 
-// --- v0.6.1: certificates matched by covered domain, not folder name ---
+// --- v0.6.1 / v0.7.0: clear saved domain (now submenu 5) ---
 
-// A certificate stored under a different folder name than its domain
-// must still be listed under the domain it covers, and revoking by
-// that domain must find it (certbot absent: manual commands, nothing
-// deleted, config untouched).
-func TestDomainSSLListAndRevokeByCoveredDomain(t *testing.T) {
-	if certbotInstalled() {
-		t.Skip("certbot is installed; this test needs it absent")
-	}
-	bin := buildTestBinary(t)
-	dataDir := t.TempDir()
-	port := freePort(t)
-	leDir := t.TempDir()
-	expiry := writeFakeCertFolder(t, leDir, "other-0001", []string{"demo.example.com"}, time.Now().Add(90*24*time.Hour))
-	// 6 = Domain & SSL, 2 = List & revoke, domain, y = confirm,
-	// 0 = back, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n2\ndemo.example.com\ny\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
-	if !strings.Contains(out, "demo.example.com") || !strings.Contains(out, "expires "+expiry.Format("2006-01-02")) {
-		t.Fatalf("list did not show the certificate under its domain:\n%s", out)
-	}
-	if !strings.Contains(out, "other-0001") {
-		t.Fatalf("list did not show the lineage name:\n%s", out)
-	}
-	if !strings.Contains(out, "certbot is not installed") || !strings.Contains(out, "certbot revoke --cert-path") {
-		t.Fatalf("missing manual revoke commands:\n%s", out)
-	}
-	if !strings.Contains(out, filepath.Join("live", "other-0001", "cert.pem")) {
-		t.Fatalf("revoke commands did not use the lineage path:\n%s", out)
-	}
-	if strings.Contains(out, "Bye") {
-		t.Fatalf("menu printed a farewell:\n%s", out)
-	}
-	if _, err := os.Stat(filepath.Join(leDir, "live", "other-0001", "fullchain.pem")); err != nil {
-		t.Fatalf("certificate was deleted without certbot: %v", err)
-	}
-	if b, err := os.ReadFile(filepath.Join(dataDir, "config.json")); err == nil {
-		var cfg Config
-		if err := json.Unmarshal(b, &cfg); err == nil && (cfg.TLSEnabled || cfg.CertFile != "" || cfg.KeyFile != "") {
-			t.Fatalf("revoke changed the config without certbot: %+v", cfg)
-		}
-	}
-}
-
-// Get SSL for a domain whose certificate lives under another folder
-// name must offer to enable HTTPS with it instead of running certbot.
-func TestDomainSSLGetUsesCoveringCert(t *testing.T) {
-	bin := buildTestBinary(t)
-	dataDir := t.TempDir()
-	port := freePort(t)
-	leDir := t.TempDir()
-	writeFakeCertFolder(t, leDir, "other-0001", []string{"demo.example.com"}, time.Now().Add(90*24*time.Hour))
-	// 6 = Domain & SSL, 1 = Get SSL, domain, y = enable, 0 = back,
-	// Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n1\ndemo.example.com\ny\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
-	if !strings.Contains(out, "Certificate already found") {
-		t.Fatalf("Get SSL did not find the covering certificate:\n%s", out)
-	}
-	if strings.Contains(out, "Running certbot") {
-		t.Fatalf("Get SSL ran certbot for a domain that already has a certificate:\n%s", out)
-	}
-	if strings.Contains(out, "Bye") {
-		t.Fatalf("menu printed a farewell:\n%s", out)
-	}
-	b, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
-	if err != nil {
-		t.Fatalf("config.json was not written: %v", err)
-	}
-	var cfg Config
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		t.Fatalf("parse config.json: %v", err)
-	}
-	if !cfg.TLSEnabled {
-		t.Fatalf("TLS was not enabled: %+v", cfg)
-	}
-	want := filepath.Join(leDir, "live", "other-0001", "fullchain.pem")
-	if cfg.CertFile != want {
-		t.Fatalf("cert file = %q, want %q", cfg.CertFile, want)
-	}
-}
-
-// Several certificates covering one domain: Get SSL lists them and
-// lets the user pick one by number.
-func TestDomainSSLGetPicksAmongCoveringCerts(t *testing.T) {
-	bin := buildTestBinary(t)
-	dataDir := t.TempDir()
-	port := freePort(t)
-	leDir := t.TempDir()
-	writeFakeCertFolder(t, leDir, "demo.example.com-0001", []string{"demo.example.com"}, time.Now().Add(30*24*time.Hour))
-	writeFakeCertFolder(t, leDir, "demo.example.com-0002", []string{"demo.example.com"}, time.Now().Add(60*24*time.Hour))
-	// 6, 1, domain, pick 2, y = enable, 0 = back, Enter, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n1\ndemo.example.com\n2\ny\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
-	if !strings.Contains(out, "More than one certificate covers") {
-		t.Fatalf("Get SSL did not list the covering certificates:\n%s", out)
-	}
-	b, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
-	if err != nil {
-		t.Fatalf("config.json was not written: %v", err)
-	}
-	var cfg Config
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		t.Fatalf("parse config.json: %v", err)
-	}
-	want := filepath.Join(leDir, "live", "demo.example.com-0002", "fullchain.pem")
-	if cfg.CertFile != want {
-		t.Fatalf("cert file = %q, want the picked certificate %q", cfg.CertFile, want)
-	}
-}
-
-// Submenu 3 clears a saved domain (and switches SSL off when it was
+// Submenu 5 clears a saved domain (and switches SSL off when it was
 // on): the config ends up with no domain and TLS off, and the menu
 // afterwards shows no domain on top.
 func TestDomainSSLClearSavedDomain(t *testing.T) {
@@ -1524,8 +1316,8 @@ func TestDomainSSLClearSavedDomain(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataDir, "config.json"), b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// 6 = Domain & SSL, 3 = Clear saved domain, 0 = back, 0 = exit.
-	out := runMenuInput(t, bin, dataDir, port, "6\n3\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	// 6 = Domain & SSL, 5 = Clear saved domain, 0 = back, 0 = exit.
+	out := runMenuInput(t, bin, dataDir, port, "6\n5\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
 	if !strings.Contains(out, "Saved domain cleared") {
 		t.Fatalf("missing clear confirmation:\n%s", out)
 	}
@@ -1617,14 +1409,14 @@ func TestMenuNoPauseOnSubmenuExit(t *testing.T) {
 	}
 }
 
-// Same check on the Clear saved domain path (6 → 3 → 0 → 0): no
+// Same check on the Clear saved domain path (6 → 5 → 0 → 0): no
 // stray pause after the submenu returns to the main menu.
 func TestMenuNoPauseOnClearDomain(t *testing.T) {
 	bin := buildTestBinary(t)
 	dataDir := t.TempDir()
 	port := freePort(t)
 	leDir := t.TempDir()
-	out := runMenuInput(t, bin, dataDir, port, "6\n3\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
+	out := runMenuInput(t, bin, dataDir, port, "6\n5\n0\n0\n", "LOADINME_LETSENCRYPT_DIR="+leDir)
 	if strings.Contains(out, "Press Enter") {
 		t.Fatalf("menu asked for an extra Enter after clearing the domain:\n%s", out)
 	}

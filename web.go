@@ -1,9 +1,11 @@
 package main
 
 import (
+	"crypto/tls"
 	_ "embed"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -26,6 +28,9 @@ var styleCSS []byte
 // /setup are public pages; everything else needs a session.
 func newRouter(store *Store, cfg Config) http.Handler {
 	mux := http.NewServeMux()
+	if store.limiter == nil {
+		store.limiter = newLoginLimiter()
+	}
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -95,12 +100,26 @@ func serve(store *Store, cfg Config) error {
 		ReadTimeout:  15 * time.Minute, // large uploads need a long read window
 		WriteTimeout: 15 * time.Minute,
 	}
-	scheme := "http"
 	if cfg.TLSEnabled && cfg.CertFile != "" && cfg.KeyFile != "" {
-		scheme = "https"
-		fmt.Printf("LoadInMe — Web UI: %s://%s\n", scheme, webAddressHost(cfg))
+		// The certificate is served through GetCertificate, which
+		// re-reads the files when they change (checked at most once
+		// a minute), so a renewal applies without a restart.
+		reloader, err := newCertReloader(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			hint := "re-issue it with: loadinme menu → 6 Domain & SSL → 1 Get SSL"
+			if strings.HasPrefix(cfg.CertFile, letsEncryptDir) {
+				hint = "it is a certbot certificate under " + letsEncryptDir +
+					", which is usually readable by root only — " + hint
+			}
+			return fmt.Errorf("could not load the SSL certificate %s (%v); %s (or turn SSL off with: loadinme ssl off)", cfg.CertFile, err, hint)
+		}
+		srv.TLSConfig = &tls.Config{
+			MinVersion:     tls.VersionTLS12,
+			GetCertificate: reloader.GetCertificate,
+		}
+		fmt.Printf("LoadInMe — Web UI: https://%s\n", webAddressHost(cfg))
 		fmt.Printf("Serving on :%d (HTTPS, %s)\n", cfg.Port, cfg.Domain)
-		return srv.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile)
+		return srv.ListenAndServeTLS("", "")
 	}
 	fmt.Printf("LoadInMe — Web UI: http://%s\n", webAddressHost(cfg))
 	fmt.Printf("Serving on :%d — open the address above in your browser (log in first)\n", cfg.Port)

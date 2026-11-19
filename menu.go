@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,7 +26,8 @@ import (
 //
 // Menu:
 //   1 Start   2 Stop   3 Restart   4 Status   5 Change port
-//   6 Domain & SSL (1 Get SSL, 2 List & revoke, 3 Clear saved domain)
+//   6 Domain & SSL (1 Get SSL, 2 SSL status, 3 Renew now,
+//     4 Turn SSL off / remove certificate, 5 Clear saved domain)
 //   7 Update
 //   8 Reset / change username & password   9 View settings
 //   10 Show web UI link   11 Uninstall   0 Exit (silent, no farewell)
@@ -88,6 +86,12 @@ func printMenuHeader(cfg Config) {
 		fmt.Println("  SSL: off  ·  domain:", cfg.Domain)
 	}
 	fmt.Printf("  Port: %d  ·  Data: %s\n", cfg.Port, cfg.DataDir)
+	// Until a login exists, the setup page asks for this one-time
+	// code, so only someone who can see this terminal can claim the
+	// install.
+	if code := readSetupCode(cfg.DataDir); code != "" {
+		fmt.Println("  Setup code: " + code + "  ·  enter it on the setup page to create your login")
+	}
 	fmt.Println("═══════════════════════════════════════════════════════════")
 	fmt.Println()
 }
@@ -129,12 +133,20 @@ func hasSystemdUser() bool {
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		return false
 	}
-	return exec.Command("systemctl", "--user", "status").Run() == nil ||
+	if u, ok := sudoInvoker(); ok {
+		// Root through sudo: the app user's own manager counts,
+		// not root's (and root's XDG_RUNTIME_DIR says nothing).
+		if _, err := os.Stat("/run/user/" + strconv.Itoa(u.uid)); err == nil {
+			return true
+		}
+		return userSystemctl("status").Run() == nil
+	}
+	return userSystemctl("status").Run() == nil ||
 		os.Getenv("XDG_RUNTIME_DIR") != ""
 }
 
 func serviceFilePath() string {
-	home, _ := os.UserHomeDir()
+	home := appHome()
 	return filepath.Join(home, ".config", "systemd", "user", "loadinme.service")
 }
 
@@ -173,7 +185,9 @@ WantedBy=default.target
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return err
 	}
-	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	chownToApp(cfg.DataDir, filepath.Join(appHome(), ".config"), filepath.Join(appHome(), ".config", "systemd"),
+		filepath.Dir(path), path)
+	_ = userSystemctl("daemon-reload").Run()
 	return nil
 }
 
@@ -185,12 +199,19 @@ var errAlreadyRunning = errors.New("web UI is already running")
 // A live /health response is the definitive proof the UI is up, however
 // it was started (systemd, nohup, or by hand).
 func probeHealth(cfg Config) bool {
-	scheme := "http"
+	// Try the scheme the config says first, then the other one: right
+	// after SSL is switched on or off, the running UI still speaks
+	// the old scheme until it restarts.
+	first, second := "http", "https"
 	if cfg.TLSEnabled {
-		scheme = "https"
+		first, second = "https", "http"
 	}
+	return probeHealthScheme(cfg, first) || probeHealthScheme(cfg, second)
+}
+
+func probeHealthScheme(cfg Config, scheme string) bool {
 	client := &http.Client{Timeout: 2 * time.Second}
-	if cfg.TLSEnabled {
+	if scheme == "https" {
 		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // localhost probe of our own server
 	}
 	resp, err := client.Get(fmt.Sprintf("%s://127.0.0.1:%d/health", scheme, cfg.Port))
@@ -313,8 +334,8 @@ func startServiceExe(cfg Config, exe string) error {
 		// Clear a failed state left by an earlier attempt (e.g. a
 		// rate-limited start before this fix), or enable --now below
 		// refuses to start the unit at all.
-		_ = exec.Command("systemctl", "--user", "reset-failed", "loadinme.service").Run()
-		cmd := exec.Command("systemctl", "--user", "enable", "--now", "loadinme.service")
+		_ = userSystemctl("reset-failed", "loadinme.service").Run()
+		cmd := userSystemctl("enable", "--now", "loadinme.service")
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			return err
@@ -331,15 +352,22 @@ func startServiceExe(cfg Config, exe string) error {
 		return err
 	}
 	defer log.Close()
+	chownToApp(cfg.DataDir, cfg.DataDir, logPath)
 	cmd := exec.Command(exe, "serve", "--port", strconv.Itoa(cfg.Port), "--data-dir", cfg.DataDir)
 	cmd.Stdout, cmd.Stderr = log, log
 	cmd.Stdin = nil
+	// As root through sudo, the web UI still runs as the real user.
+	if u, ok := sudoInvoker(); ok {
+		setRunAs(cmd, u.uid, u.gid)
+		cmd.Env = append(os.Environ(), "HOME="+u.home)
+	}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	if err := os.WriteFile(pidFile(cfg), []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
 		return err
 	}
+	chownToApp(cfg.DataDir, pidFile(cfg))
 	if !waitHealthy(cfg) {
 		// The child never came up (port still held, DB lock, …) —
 		// kill it and drop the PID file so a half-started process
@@ -354,7 +382,7 @@ func startServiceExe(cfg Config, exe string) error {
 
 func stopService(cfg Config) error {
 	if hasSystemdUser() {
-		cmd := exec.Command("systemctl", "--user", "stop", "loadinme.service")
+		cmd := userSystemctl("stop", "loadinme.service")
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Run(); err != nil {
 			return err
@@ -394,7 +422,7 @@ func isServiceRunning(cfg Config) bool {
 		return true
 	}
 	if hasSystemdUser() {
-		return exec.Command("systemctl", "--user", "is-active", "--quiet", "loadinme.service").Run() == nil
+		return userSystemctl("is-active", "--quiet", "loadinme.service").Run() == nil
 	}
 	if pid, ok := pidFromFile(cfg); ok {
 		return pidAlive(pid)
@@ -458,233 +486,14 @@ func withServiceStopped(cfg Config, fn func() error) error {
 	return fnErr
 }
 
-// letsEncryptDir is the base directory of the Let's Encrypt data
-// (/etc/letsencrypt/live/<domain>/ holds each certificate). It is a
-// variable, not a constant, so tests can point it at a temp dir —
-// the real /etc/letsencrypt is root-owned and may not exist here.
+// letsEncryptDir is where certbot keeps its certificates. LoadInMe
+// no longer uses certbot (v0.7.0), but configs from earlier versions
+// can still point there; they keep working and the menu suggests
+// re-issuing. A variable so tests can point it elsewhere.
 var letsEncryptDir = "/etc/letsencrypt"
 
-// findCerts looks for a Let's Encrypt certificate for a domain: first
-// a lineage folder named after the domain, then any certificate whose
-// covered domains include it. A lineage name can differ from the
-// domain it covers (a multi-domain cert, or a lineage named
-// example.com-0001), so matching by folder name alone would miss it.
-func findCerts(domain string) (cert, key string, ok bool) {
-	cert = filepath.Join(letsEncryptDir, "live", domain, "fullchain.pem")
-	key = filepath.Join(letsEncryptDir, "live", domain, "privkey.pem")
-	if _, err := os.Stat(cert); err == nil {
-		if _, err := os.Stat(key); err == nil {
-			return cert, key, true
-		}
-	}
-	for _, c := range findCertsByDomain(domain) {
-		return c.certPath(), c.keyPath(), true
-	}
-	return "", "", false
-}
-
-// findCertsByDomain returns every lineage whose certificate covers
-// domain (case-insensitive), in display order.
-func findCertsByDomain(domain string) []certInfo {
-	certs, err := listCerts()
-	if err != nil {
-		return nil
-	}
-	var out []certInfo
-	for _, c := range certs {
-		if c.covers(domain) {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// domainSSLMenu is the "Domain & SSL" submenu (menu option 6):
-// 1 gets an SSL certificate, 2 lists certificates and revokes one,
-// 3 clears the saved domain, 0 goes back to the main menu (never
-// exits the app).
-func domainSSLMenu(cfg *Config, scanner *bufio.Scanner) {
-	for {
-		fmt.Println("  Domain & SSL")
-		if cfg.Domain != "" {
-			ssl := "off"
-			if cfg.TLSEnabled {
-				ssl = "on"
-			}
-			fmt.Println("  Domain:", cfg.Domain, " ·  SSL:", ssl)
-		} else {
-			fmt.Println("  Domain: (none set)")
-		}
-		fmt.Println("  1  Get SSL (enter domain, then email)")
-		fmt.Println("  2  List certificates & revoke one")
-		fmt.Println("  3  Clear saved domain")
-		fmt.Println("  0  Back to main menu")
-		fmt.Println()
-		fmt.Print("  Choose [0-3]: ")
-		if !scanner.Scan() {
-			return
-		}
-		choice := strings.TrimSpace(scanner.Text())
-		fmt.Println()
-		switch choice {
-		case "1":
-			getSSLCert(cfg, scanner)
-		case "2":
-			listAndRevokeCerts(cfg, scanner)
-		case "3":
-			clearSavedDomain(cfg)
-		case "0":
-			return
-		default:
-			fmt.Println("Please choose 0-3.")
-		}
-	}
-}
-
-// getSSLCert is submenu 1: enter a domain, then an email, and get a
-// Let's Encrypt certificate for it (or enable HTTPS with one that
-// already exists). The domain is saved as soon as it is entered, so
-// the next visit already knows it.
-func getSSLCert(cfg *Config, scanner *bufio.Scanner) {
-	domain, cancelled := promptCancel(scanner, "Domain (example: files.example.com)", cfg.Domain)
-	if cancelled {
-		fmt.Println("Cancelled.")
-		return
-	}
-	domain = strings.TrimSpace(domain)
-	if domain == "" {
-		fmt.Println("A domain is required. Nothing changed.")
-		return
-	}
-	cfg.Domain = domain
-	_ = saveConfig(*cfg)
-	// Match by the domains a certificate covers, not by folder name:
-	// the domain may already have a certificate under a different
-	// lineage name, and running certbot for it again would ask
-	// whether to change that certificate's key type.
-	matches := findCertsByDomain(domain)
-	if len(matches) > 0 {
-		var chosen certInfo
-		if len(matches) == 1 {
-			chosen = matches[0]
-			fmt.Println("Certificate already found:")
-			fmt.Println("  ", chosen.certPath())
-			fmt.Println("  ", chosen.keyPath())
-		} else {
-			fmt.Println("More than one certificate covers", domain+":")
-			var ok bool
-			chosen, ok = pickCert(scanner, matches, *cfg)
-			if !ok {
-				return
-			}
-		}
-		ans, cancelled := promptCancel(scanner, "Enable HTTPS with this certificate? (y/n)", "y")
-		if cancelled {
-			fmt.Println("Cancelled.")
-			return
-		}
-		if strings.ToLower(ans) == "y" || strings.ToLower(ans) == "yes" {
-			enableSSL(cfg, chosen.certPath(), chosen.keyPath())
-		}
-		return
-	}
-	fmt.Println("No certificate found yet for", domain)
-	fmt.Println("You need: a domain pointing at this server, and port 80 free for a few seconds while certbot runs.")
-	fmt.Println("The web UI keeps serving on your chosen port — the certificate does not move it to 443.")
-	if _, err := exec.LookPath("certbot"); err != nil {
-		fmt.Println("certbot is not installed. Run these commands on the server:")
-		fmt.Println("  sudo apt update && sudo apt install -y certbot")
-		fmt.Println("  sudo certbot certonly --standalone -d " + domain + " --cert-name " + domain)
-		fmt.Println("Then come back here — I will find the certificate and turn SSL on.")
-		return
-	}
-	fmt.Println("certbot is installed.")
-	email, cancelled := promptCancel(scanner, "Email for Let's Encrypt (expiry notices)", "")
-	if cancelled {
-		fmt.Println("Cancelled.")
-		return
-	}
-	if email == "" {
-		fmt.Println("An email is required by certbot. Nothing changed.")
-		return
-	}
-	wasRunning := isServiceRunning(*cfg)
-	if wasRunning {
-		fmt.Println("Stopping the web UI first — certbot needs port 80 free.")
-		_ = stopService(*cfg)
-	}
-	// certbot's --standalone mode must bind port 80 for a few seconds
-	// to prove the domain is yours (a Let's Encrypt rule, not ours).
-	// On a server that already runs other websites port 80 is usually
-	// taken — running certbot then would only fail, so check first.
-	if !portFree(80) {
-		fmt.Println("Port 80 is already in use on this server, so certbot cannot prove the domain is yours.")
-		fmt.Println("Something else is already using port 80 — probably the other website on this server.")
-		fmt.Println("certbot only needs port 80 for a few seconds. Freeing it that briefly is safe:")
-		fmt.Println("the service on it just pauses and comes back — nothing breaks, and at worst")
-		fmt.Println("a visitor's page waits a few seconds.")
-		fmt.Println("  1. See what is using port 80:")
-		fmt.Println("       sudo ss -tlnp | grep ':80'")
-		fmt.Println("  2. Stop that service briefly — for example, only if it is nginx:")
-		fmt.Println("       sudo systemctl stop nginx")
-		fmt.Println("  3. Run Get SSL again here, then start the service back:")
-		fmt.Println("       sudo systemctl start nginx")
-		fmt.Println("Or get the certificate another way (webroot or DNS) — once a certificate exists")
-		fmt.Println("for the domain, come back here and I will find it and turn SSL on.")
-		fmt.Println("Nothing was changed.")
-		if wasRunning {
-			restartAfterSSL(cfg)
-		}
-		return
-	}
-	fmt.Println("Running certbot — this may ask for sudo…")
-	// --cert-name names the new lineage after the domain, so future
-	// lookups by domain find it by folder name too.
-	cmd := exec.Command("sudo", "certbot", "certonly", "--standalone", "-d", domain,
-		"--cert-name", domain, "--agree-tos", "--non-interactive", "--email", email)
-	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-	if err := cmd.Run(); err != nil {
-		fmt.Println("certbot failed:", err)
-		fmt.Println("Check that the domain points at this server and port 80 is open, then try again.")
-		if wasRunning {
-			restartAfterSSL(cfg)
-		}
-		return
-	}
-	cert, key, ok := findCerts(domain)
-	if !ok {
-		fmt.Println("certbot finished but I cannot find the certificate. Check " + filepath.Join(letsEncryptDir, "live", domain) + "/")
-		if wasRunning {
-			restartAfterSSL(cfg)
-		}
-		return
-	}
-	enableSSL(cfg, cert, key)
-}
-
-// enableSSL turns TLS on with the given certificate and restarts the
-// web UI when it was running, so https serves right away instead of
-// waiting for a manual restart.
-func enableSSL(cfg *Config, cert, key string) {
-	cfg.TLSEnabled = true
-	cfg.CertFile, cfg.KeyFile = cert, key
-	_ = saveConfig(*cfg)
-	fmt.Println("SSL is on — certificate found at", cert)
-	if isServiceRunning(*cfg) {
-		fmt.Println("Restarting the web UI to serve " + webAddressFor(*cfg) + "…")
-		if err := restartService(*cfg); err != nil {
-			fmt.Println("SSL is on, but the web UI could not be restarted:", err)
-			fmt.Println("Start it with option 1.")
-			return
-		}
-		fmt.Println("Web UI is now serving " + webAddressFor(*cfg))
-	} else {
-		fmt.Println("Start the web UI with option 1 to serve " + webAddressFor(*cfg))
-	}
-}
-
-// portFree reports whether anything is listening on the given TCP
-// port right now: it tries to bind the port and lets go at once.
+// portFree reports whether a TCP port can be bound right now: it
+// tries to bind the port and lets go at once.
 func portFree(port int) bool {
 	ln, err := net.Listen("tcp", ":"+strconv.Itoa(port))
 	if err != nil {
@@ -694,204 +503,7 @@ func portFree(port int) bool {
 	return true
 }
 
-// restartAfterSSL restarts the web UI after an SSL step that stopped
-// it but did not enable SSL (e.g. certbot failed) — the UI must not
-// be left down.
-func restartAfterSSL(cfg *Config) {
-	fmt.Println("Restarting the web UI…")
-	if err := restartService(*cfg); err != nil {
-		fmt.Println("The web UI could not be restarted:", err)
-		fmt.Println("Start it with option 1.")
-	}
-}
-
-// certInfo is one certificate found under <letsEncryptDir>/live/.
-// lineage is the folder name (certbot's name for the certificate);
-// domains are the names the certificate actually covers, read from
-// the certificate itself. The two can differ (a multi-domain cert,
-// or a lineage named example.com-0001), so matching is always by
-// domain, never by folder name alone.
-type certInfo struct {
-	lineage   string
-	domains   []string
-	expiry    time.Time
-	hasExpiry bool
-}
-
-// certPath is the certificate file for this lineage.
-func (c certInfo) certPath() string {
-	return filepath.Join(letsEncryptDir, "live", c.lineage, "fullchain.pem")
-}
-
-// keyPath is the private key file for this lineage.
-func (c certInfo) keyPath() string {
-	return filepath.Join(letsEncryptDir, "live", c.lineage, "privkey.pem")
-}
-
-// primaryDomain is the first domain the certificate covers, or the
-// lineage name when the certificate could not be parsed.
-func (c certInfo) primaryDomain() string {
-	if len(c.domains) > 0 {
-		return c.domains[0]
-	}
-	return c.lineage
-}
-
-// covers reports whether the certificate covers domain
-// (case-insensitive).
-func (c certInfo) covers(domain string) bool {
-	for _, d := range c.domains {
-		if strings.EqualFold(d, domain) {
-			return true
-		}
-	}
-	return false
-}
-
-// describeCert is one line for the certificate list: the domains it
-// covers, its expiry date, and whether it is the one in use.
-func describeCert(c certInfo, cfg Config) string {
-	name := c.primaryDomain()
-	if len(c.domains) > 1 {
-		name += " (also covers: " + strings.Join(c.domains[1:], ", ") + ")"
-	}
-	if c.lineage != c.primaryDomain() {
-		name += " [certificate " + c.lineage + "]"
-	}
-	expiry := "expiry unknown"
-	if c.hasExpiry {
-		expiry = "expires " + c.expiry.Format("2006-01-02")
-	}
-	inUse := ""
-	if cfg.TLSEnabled && c.covers(cfg.Domain) {
-		inUse = "  (in use)"
-	}
-	return fmt.Sprintf("  %s — %s%s", name, expiry, inUse)
-}
-
-// pickCert asks the user to choose one of several certificates by
-// number. It returns false when the user cancels with 0.
-func pickCert(scanner *bufio.Scanner, certs []certInfo, cfg Config) (certInfo, bool) {
-	for i, c := range certs {
-		fmt.Printf("  %d  %s\n", i+1, describeCert(c, cfg))
-	}
-	ans, cancelled := promptCancel(scanner, "Which one", "")
-	if cancelled {
-		fmt.Println("Cancelled.")
-		return certInfo{}, false
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(ans))
-	if err != nil || n < 1 || n > len(certs) {
-		fmt.Println("That is not one of the certificates. Nothing changed.")
-		return certInfo{}, false
-	}
-	return certs[n-1], true
-}
-
-// listCerts returns every certificate under <letsEncryptDir>/live/.
-// Each subdirectory is one certificate; the covered domains and the
-// expiry are read from the certificate itself (crypto/x509, no
-// openssl needed). A certificate that cannot be parsed is still
-// listed by its folder name, with no domains and unknown expiry.
-func listCerts() ([]certInfo, error) {
-	liveDir := filepath.Join(letsEncryptDir, "live")
-	entries, err := os.ReadDir(liveDir)
-	if err != nil {
-		return nil, err
-	}
-	var out []certInfo
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		info := certInfo{lineage: e.Name()}
-		if b, err := os.ReadFile(filepath.Join(liveDir, e.Name(), "fullchain.pem")); err == nil {
-			if block, _ := pem.Decode(b); block != nil {
-				if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
-					info.expiry = cert.NotAfter
-					info.hasExpiry = true
-					info.domains = cert.DNSNames
-					if len(info.domains) == 0 && cert.Subject.CommonName != "" {
-						info.domains = []string{cert.Subject.CommonName}
-					}
-				}
-			}
-		}
-		out = append(out, info)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].primaryDomain() != out[j].primaryDomain() {
-			return out[i].primaryDomain() < out[j].primaryDomain()
-		}
-		return out[i].lineage < out[j].lineage
-	})
-	return out, nil
-}
-
-// listAndRevokeCerts is submenu 2: show every Let's Encrypt
-// certificate with its expiry date, and revoke one by domain. A
-// certificate is found by the domains it covers, not by its folder
-// name, so one stored under another name still shows up and can be
-// revoked by typing the domain it covers.
-func listAndRevokeCerts(cfg *Config, scanner *bufio.Scanner) {
-	liveDir := filepath.Join(letsEncryptDir, "live")
-	certs, err := listCerts()
-	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Println("No certificates found (checked", liveDir+").")
-			return
-		}
-		fmt.Println("Could not read", liveDir, "—", err)
-		fmt.Println("The certificate directory is usually only readable as root: run the menu with sudo (sudo loadinme menu) and try again.")
-		return
-	}
-	if len(certs) == 0 {
-		fmt.Println("No certificates found (checked", liveDir+").")
-		return
-	}
-	fmt.Println("Certificates in", liveDir+":")
-	for _, c := range certs {
-		fmt.Println(describeCert(c, *cfg))
-	}
-	domain, cancelled := promptCancel(scanner, "Domain to revoke", "")
-	if cancelled {
-		fmt.Println("Cancelled.")
-		return
-	}
-	domain = strings.TrimSpace(domain)
-	if domain == "" {
-		fmt.Println("No domain given. Nothing revoked.")
-		return
-	}
-	matches := findCertsByDomain(domain)
-	if len(matches) == 0 {
-		fmt.Println("No certificate covers", domain+". Nothing revoked.")
-		return
-	}
-	var chosen certInfo
-	if len(matches) == 1 {
-		chosen = matches[0]
-	} else {
-		fmt.Println("More than one certificate covers", domain+":")
-		var ok bool
-		chosen, ok = pickCert(scanner, matches, *cfg)
-		if !ok {
-			return
-		}
-	}
-	ans, cancelled := promptCancel(scanner, "Revoke the certificate for "+chosen.primaryDomain()+"? This cannot be undone (y/n)", "n")
-	if cancelled {
-		fmt.Println("Cancelled.")
-		return
-	}
-	if strings.ToLower(ans) != "y" && strings.ToLower(ans) != "yes" {
-		fmt.Println("Not revoked.")
-		return
-	}
-	revokeCert(cfg, chosen)
-}
-
-// clearSavedDomain is submenu 3: forget the saved domain, so it
+// clearSavedDomain is submenu 5: forget the saved domain, so it
 // stops showing on top of the menu. If SSL was on for that domain,
 // it is switched off too and the web UI restarts on plain http.
 func clearSavedDomain(cfg *Config) {
@@ -923,49 +535,6 @@ func clearSavedDomain(cfg *Config) {
 	}
 }
 
-// revokeCert revokes a certificate with certbot, and turns SSL off in
-// the config when it was the one in use. cert identifies the lineage
-// (its folder name may differ from the domain it covers).
-func revokeCert(cfg *Config, cert certInfo) {
-	certPath := filepath.Join(letsEncryptDir, "live", cert.lineage, "cert.pem")
-	if _, err := exec.LookPath("certbot"); err != nil {
-		fmt.Println("certbot is not installed — nothing was revoked and nothing was deleted.")
-		fmt.Println("To revoke this certificate by hand, run:")
-		fmt.Println("  sudo certbot revoke --cert-path " + certPath + " --delete-after-revoke")
-		fmt.Println("  sudo rm -rf " + filepath.Join(letsEncryptDir, "live", cert.lineage) + " " + filepath.Join(letsEncryptDir, "archive", cert.lineage) + " " + filepath.Join(letsEncryptDir, "renewal", cert.lineage+".conf"))
-		return
-	}
-	fmt.Println("Running certbot revoke — this may ask for sudo…")
-	cmd := exec.Command("sudo", "certbot", "revoke", "--cert-path", certPath, "--delete-after-revoke", "--non-interactive")
-	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
-	if err := cmd.Run(); err != nil {
-		fmt.Println("certbot revoke failed:", err)
-		fmt.Println("Nothing was changed.")
-		return
-	}
-	fmt.Println("Certificate for", cert.primaryDomain(), "revoked.")
-	if cert.lineage != cert.primaryDomain() {
-		fmt.Println("(certificate " + cert.lineage + ")")
-	}
-	if cfg.TLSEnabled && cert.covers(cfg.Domain) {
-		cfg.TLSEnabled = false
-		cfg.CertFile, cfg.KeyFile = "", ""
-		_ = saveConfig(*cfg)
-		fmt.Println("SSL is now off — that was the certificate in use.")
-		if isServiceRunning(*cfg) {
-			fmt.Println("Restarting the web UI to serve http again…")
-			if err := restartService(*cfg); err != nil {
-				fmt.Println("SSL is off, but the web UI could not be restarted:", err)
-				fmt.Println("Start it with option 1.")
-				return
-			}
-			fmt.Println("Web UI is now serving http://" + cfg.Domain)
-		} else {
-			fmt.Println("The web UI is stopped; start it with option 1 when ready.")
-		}
-	}
-}
-
 // selfUpdate downloads the latest release binary, replaces the
 // running one, and restarts the web UI so the new version applies.
 // Safe order: stop the old process BEFORE replacing the binary, then
@@ -976,7 +545,7 @@ func selfUpdate(cfg Config) error {
 	if arch != "amd64" && arch != "arm64" {
 		return fmt.Errorf("unsupported architecture %s (only amd64/arm64 releases exist)", arch)
 	}
-	url := "https://github.com/sahfar363/loadinme/releases/latest/download/loadinme-linux-" + arch
+	url := "https://github.com/sahand363/loadinme/releases/latest/download/loadinme-linux-" + arch
 	fmt.Println("Downloading", url)
 	tmp, err := os.CreateTemp("", "loadinme-update-*")
 	if err != nil {
@@ -1085,10 +654,23 @@ func uninstall(cfg Config, scanner *bufio.Scanner) bool {
 		return false
 	}
 	_ = stopService(cfg)
+	// Root-owned pieces from Get SSL: the renewal timer and any
+	// leftover nginx snippet.
+	if systemPiecesPresent() {
+		if isRoot() {
+			removeSystemPieces(os.Stdout)
+		} else {
+			fmt.Println("Removing the SSL renewal timer / nginx snippet needs root — asking sudo…")
+			if err := runAsRoot("ssl", "cleanup-system"); err != nil {
+				fmt.Println("Could not remove them:", err)
+				fmt.Println("Run: sudo systemctl disable --now loadinme-renew.timer; sudo rm -f /etc/systemd/system/loadinme-renew.* /etc/nginx/conf.d/loadinme-acme-*.conf")
+			}
+		}
+	}
 	if hasSystemdUser() {
-		_ = exec.Command("systemctl", "--user", "disable", "--now", "loadinme.service").Run()
+		_ = userSystemctl("disable", "--now", "loadinme.service").Run()
 		_ = os.Remove(serviceFilePath())
-		_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+		_ = userSystemctl("daemon-reload").Run()
 	}
 	exe, err := os.Executable()
 	if err == nil {
@@ -1133,6 +715,17 @@ func runMenu(cfg *Config) {
 	// flows do not depend on the machine's real /etc/letsencrypt.
 	if d := os.Getenv("LOADINME_LETSENCRYPT_DIR"); d != "" {
 		letsEncryptDir = d
+	}
+	// No login yet and the web UI not running (it makes the code
+	// itself when it starts): make the one-time setup code now, so
+	// the header can show it.
+	if readSetupCode(cfg.DataDir) == "" && !isServiceRunning(*cfg) {
+		_ = withStore(cfg, func(store *Store) error {
+			if has, _ := store.HasUser(); !has {
+				_, _ = ensureSetupCode(cfg.DataDir)
+			}
+			return nil
+		})
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -1235,7 +828,7 @@ func runMenu(cfg *Config) {
 			if err := selfUpdate(*cfg); err != nil {
 				fmt.Println("Update failed:", err)
 				fmt.Println("You can also run the installer again:")
-				fmt.Println("  curl -fsSL https://raw.githubusercontent.com/sahfar363/loadinme/main/install.sh | bash")
+				fmt.Println("  curl -fsSL https://raw.githubusercontent.com/sahand363/loadinme/main/install.sh | bash")
 			}
 			pause(scanner)
 		case "8":
@@ -1286,7 +879,11 @@ func runMenu(cfg *Config) {
 			pause(scanner)
 		case "10":
 			fmt.Println("Web UI:", webAddressFor(*cfg))
-			fmt.Println("Local:  http://localhost:" + strconv.Itoa(cfg.Port))
+			if cfg.TLSEnabled {
+				fmt.Println("Local:  https://localhost:" + strconv.Itoa(cfg.Port) + "  (the certificate is for " + cfg.Domain + ")")
+			} else {
+				fmt.Println("Local:  http://localhost:" + strconv.Itoa(cfg.Port))
+			}
 			pause(scanner)
 		case "11":
 			if uninstall(*cfg, scanner) {

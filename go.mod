@@ -1,4 +1,4 @@
-module github.com/sahfar363/loadinme
+module github.com/sahand363/loadinme
 
 go 1.23
 

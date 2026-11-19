@@ -26,8 +26,8 @@ func defaultDataDir() string {
 	if d := os.Getenv("LOADINME_DATA"); d != "" {
 		return d
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
+	home := appHome()
+	if home == "" {
 		return ".loadinme"
 	}
 	return filepath.Join(home, ".loadinme")
@@ -74,5 +74,9 @@ func saveConfig(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath(cfg.DataDir), b, 0o644)
+	if err := os.WriteFile(configPath(cfg.DataDir), b, 0o644); err != nil {
+		return err
+	}
+	chownToApp(cfg.DataDir, cfg.DataDir, configPath(cfg.DataDir))
+	return nil
 }

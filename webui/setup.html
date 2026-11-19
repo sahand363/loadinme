@@ -10,21 +10,34 @@
 <div class="login-wrap">
   <h1>⬆ LoadInMe</h1>
   <p>First run — create your login. You can change it later from the SSH menu or Settings.</p>
+  <p>Enter the setup code first. It is shown on the server: in the installer output, on top of
+    <code>loadinme menu</code>, and in the file <code>~/.loadinme/setup-code</code>.</p>
   <form method="post" action="/setup">
+    <label>Setup code (from the server)</label>
+    <input name="code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH" autofocus required>
     <label>Username</label>
-    <input name="username" autocomplete="username" autofocus required>
-    <label>Password (at least 4 characters)</label>
-    <input type="password" name="password" autocomplete="new-password" required minlength="4">
+    <input name="username" autocomplete="username" required>
+    <label>Password (at least 8 characters)</label>
+    <input type="password" name="password" autocomplete="new-password" required minlength="8">
     <label>Repeat password</label>
-    <input type="password" name="confirm" autocomplete="new-password" required minlength="4">
+    <input type="password" name="confirm" autocomplete="new-password" required minlength="8">
     <button class="btn" type="submit">Create login</button>
   </form>
   <div class="error" id="err"></div>
 </div>
 <script>
-  if (new URLSearchParams(location.search).get('error')) {
-    document.getElementById('err').textContent = 'Check the fields — username required, password at least 4 characters, and both passwords must match.';
-  }
+  (function () {
+    var q = new URLSearchParams(location.search), e = q.get('error'), msg = '';
+    if (e === 'code') {
+      msg = 'That setup code is not right. Copy it from the server (top of loadinme menu, or ~/.loadinme/setup-code).';
+    } else if (e === 'locked') {
+      var m = Math.max(1, Math.ceil((parseInt(q.get('wait'), 10) || 60) / 60));
+      msg = 'Too many wrong tries. Wait ' + m + ' minute' + (m === 1 ? '' : 's') + ' and try again.';
+    } else if (e) {
+      msg = 'Check the fields — username required, password at least 8 characters, and both passwords must match.';
+    }
+    document.getElementById('err').textContent = msg;
+  })();
 </script>
 </body>
 </html>

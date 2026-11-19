@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,20 @@ import (
 )
 
 const maxClipBytes = 1024 * 1024 // 1 MB of text per clip
+
+// uploadOverheadBytes is the room an upload request gets on top of
+// the max file size, for multipart headers and the small form fields.
+const uploadOverheadBytes = 8 << 20
+
+// lockedRedirect sends a locked-out visitor back to the page with the
+// wait in seconds, so the page can say how long to wait.
+func lockedRedirect(w http.ResponseWriter, r *http.Request, page string, wait time.Duration) {
+	secs := int(wait.Round(time.Second) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	http.Redirect(w, r, page+"?error=locked&wait="+strconv.Itoa(secs), http.StatusSeeOther)
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -45,19 +60,29 @@ func (s *Store) handleLoginPage(cfg Config) http.HandlerFunc {
 			return
 		}
 		if r.Method == http.MethodPost {
+			ip := clientIP(r)
+			if wait, locked := s.limiter.blocked(ip); locked {
+				lockedRedirect(w, r, "/login", wait)
+				return
+			}
 			username := strings.TrimSpace(r.FormValue("username"))
 			password := r.FormValue("password")
 			name, hash, _ := s.GetUser()
 			if username != name || !verifyPassword(hash, password) {
+				if wait := s.limiter.fail(ip); wait > 0 {
+					lockedRedirect(w, r, "/login", wait)
+					return
+				}
 				http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
 				return
 			}
+			s.limiter.succeed(ip)
 			token, err := s.CreateSession(username)
 			if err != nil {
 				http.Error(w, "could not create session", http.StatusInternalServerError)
 				return
 			}
-			s.setSessionCookie(w, token)
+			s.setSessionCookie(w, r, token)
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
@@ -74,10 +99,27 @@ func (s *Store) handleSetupPage(cfg Config) http.HandlerFunc {
 			return
 		}
 		if r.Method == http.MethodPost {
+			ip := clientIP(r)
+			if wait, locked := s.limiter.blocked(ip); locked {
+				lockedRedirect(w, r, "/setup", wait)
+				return
+			}
+			// The one-time setup code proves the visitor can see
+			// this server's terminal, so a stranger who finds a
+			// fresh install first cannot claim it.
+			want := readSetupCode(s.DataDir())
+			if !setupCodeMatches(want, r.FormValue("code")) {
+				if wait := s.limiter.fail(ip); wait > 0 {
+					lockedRedirect(w, r, "/setup", wait)
+					return
+				}
+				http.Redirect(w, r, "/setup?error=code", http.StatusSeeOther)
+				return
+			}
 			username := strings.TrimSpace(r.FormValue("username"))
 			password := r.FormValue("password")
 			confirm := r.FormValue("confirm")
-			if username == "" || len(password) < 4 || password != confirm {
+			if username == "" || len(password) < minPasswordLen || password != confirm {
 				http.Redirect(w, r, "/setup?error=1", http.StatusSeeOther)
 				return
 			}
@@ -90,15 +132,20 @@ func (s *Store) handleSetupPage(cfg Config) http.HandlerFunc {
 				http.Error(w, "could not save user", http.StatusInternalServerError)
 				return
 			}
+			s.limiter.succeed(ip)
+			removeSetupCode(s.DataDir())
 			token, err := s.CreateSession(username)
 			if err != nil {
 				http.Error(w, "could not create session", http.StatusInternalServerError)
 				return
 			}
-			s.setSessionCookie(w, token)
+			s.setSessionCookie(w, r, token)
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
+		// Make sure a setup code exists (the server also prints it
+		// when it starts): the page is useless without one.
+		_, _ = ensureSetupCode(s.DataDir())
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(setupHTML)
 	}
@@ -108,7 +155,7 @@ func (s *Store) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		_ = s.DeleteSession(c.Value)
 	}
-	s.clearSessionCookie(w)
+	s.clearSessionCookie(w, r)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
@@ -142,15 +189,27 @@ func (s *Store) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	keepForever := r.FormValue("keepForever") == "true" || r.FormValue("keepForever") == "1"
-	relPath := sanitizeRelPath(r.FormValue("relPath"))
-
-	// Cap the in-memory multipart parsing; the file body itself is
-	// streamed below with a hard limit of maxFileMB+1.
+	maxBytes := int64(st.MaxFileMB) << 20
+	// Cap the whole request body BEFORE anything parses it (the
+	// multipart parser spills big parts to temp files, so without a
+	// cap a client could fill the disk with one huge request): the
+	// file limit plus some room for the form fields and headers.
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes+uploadOverheadBytes)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeErr(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("file is too large: exceeds the %d MB limit (change it in Settings)", st.MaxFileMB))
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "could not parse upload: "+err.Error())
 		return
 	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	keepForever := r.FormValue("keepForever") == "true" || r.FormValue("keepForever") == "1"
+	relPath := sanitizeRelPath(r.FormValue("relPath"))
 	f, hdr, err := r.FormFile("file")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "no file in upload (field name must be 'file')")
@@ -158,7 +217,6 @@ func (s *Store) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 
-	maxBytes := int64(st.MaxFileMB) << 20
 	// Reject obviously-too-big files early when the client told us.
 	if hdr.Size > maxBytes {
 		writeErr(w, http.StatusRequestEntityTooLarge,
@@ -398,8 +456,8 @@ func (s *Store) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "current password is wrong")
 		return
 	}
-	if len(req.NewPassword) < 4 {
-		writeErr(w, http.StatusBadRequest, "new password must be at least 4 characters")
+	if len(req.NewPassword) < minPasswordLen {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("new password must be at least %d characters", minPasswordLen))
 		return
 	}
 	newHash, err := hashPassword(req.NewPassword)

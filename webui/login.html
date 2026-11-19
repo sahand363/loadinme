@@ -20,9 +20,16 @@
   <div class="error" id="err"></div>
 </div>
 <script>
-  if (new URLSearchParams(location.search).get('error')) {
-    document.getElementById('err').textContent = 'Wrong username or password. Try again.';
-  }
+  (function () {
+    var q = new URLSearchParams(location.search), e = q.get('error'), msg = '';
+    if (e === 'locked') {
+      var m = Math.max(1, Math.ceil((parseInt(q.get('wait'), 10) || 60) / 60));
+      msg = 'Too many wrong tries. Wait ' + m + ' minute' + (m === 1 ? '' : 's') + ' and try again.';
+    } else if (e) {
+      msg = 'Wrong username or password. Try again.';
+    }
+    document.getElementById('err').textContent = msg;
+  })();
 </script>
 </body>
 </html>

@@ -47,18 +47,22 @@ func (s *Store) currentUser(r *http.Request) (string, bool) {
 	return s.SessionUser(c.Value)
 }
 
-func (s *Store) setSessionCookie(w http.ResponseWriter, token string) {
+// setSessionCookie sets the login cookie. With HTTPS on, the cookie
+// is marked Secure, so a browser never sends it over plain http.
+func (s *Store) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: token, Path: "/",
 		HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		Secure: requestIsHTTPS(r),
 		MaxAge: 30 * 24 * 60 * 60, // 30 days
 	})
 }
 
-func (s *Store) clearSessionCookie(w http.ResponseWriter) {
+func (s *Store) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/",
 		HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1,
+		Secure: requestIsHTTPS(r),
 	})
 }
 
@@ -106,8 +110,8 @@ func setPasswordCLI(store *Store, username string, scanner *bufio.Scanner) error
 	if strings.TrimSpace(pw) == "0" {
 		return errCancelled
 	}
-	if len(pw) < 4 {
-		return fmt.Errorf("password must be at least 4 characters")
+	if len(pw) < minPasswordLen {
+		return fmt.Errorf("password must be at least %d characters", minPasswordLen)
 	}
 	fmt.Print("Repeat password (0 to cancel): ")
 	if !scanner.Scan() {
@@ -126,6 +130,8 @@ func setPasswordCLI(store *Store, username string, scanner *bufio.Scanner) error
 	if err := store.SetUser(username, hash); err != nil {
 		return err
 	}
+	// A login exists now, so the one-time setup code is no longer needed.
+	removeSetupCode(store.DataDir())
 	if err := store.ClearSessions(); err != nil {
 		return fmt.Errorf("password set but could not log out old sessions: %w", err)
 	}
