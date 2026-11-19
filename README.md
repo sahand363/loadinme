@@ -1,5 +1,7 @@
 # LoadInMe ⬆
 
+<p align="center"><img src="docs/screenshot.webp" alt="LoadInMe screenshot" width="360"></p>
+
 A small Go app for sharing files and text from your own VPS. One web page,
 two panels: **files on the left** (Windows Explorer style) and a
 **clipboard on the right**. Everything expires after 24 hours unless you
