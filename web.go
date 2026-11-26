@@ -24,6 +24,12 @@ var appJS []byte
 //go:embed webui/style.css
 var styleCSS []byte
 
+//go:embed webui/favicon.ico
+var faviconICO []byte
+
+//go:embed webui/icon.png
+var iconPNG []byte
+
 // newRouter builds the HTTP router. /health is public; /login and
 // /setup are public pages; everything else needs a session.
 func newRouter(store *Store, cfg Config) http.Handler {
@@ -39,6 +45,17 @@ func newRouter(store *Store, cfg Config) http.Handler {
 	mux.HandleFunc("/login", store.handleLoginPage(cfg))
 	mux.HandleFunc("/setup", store.handleSetupPage(cfg))
 	mux.HandleFunc("/logout", store.handleLogout)
+	// App icon: public so the browser tab and the login page show it.
+	serveIcon := func(ctype string, b []byte) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", ctype)
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			_, _ = w.Write(b)
+		}
+	}
+	mux.HandleFunc("/favicon.ico", serveIcon("image/x-icon", faviconICO))
+	mux.HandleFunc("/icon.png", serveIcon("image/png", iconPNG))
+	mux.HandleFunc("/apple-touch-icon.png", serveIcon("image/png", iconPNG))
 	// The login/setup pages need the stylesheet before any session exists.
 	mux.HandleFunc("/style.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")

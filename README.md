@@ -1,4 +1,6 @@
-# LoadInMe ⬆
+<p align="center"><img src="docs/icon.png" alt="LoadInMe icon" width="120"></p>
+
+# LoadInMe
 
 <p align="center"><img src="docs/screenshot.webp" alt="LoadInMe screenshot" width="360"></p>
 
@@ -29,6 +31,11 @@ protects the whole thing.
 - **Light** — one static Go binary, no database server. Metadata lives in
   a small embedded database (`~/.loadinme/loadinme.db`), files in
   `~/.loadinme/uploads/`. Fits a 1 GB RAM server easily.
+
+## v0.8.1
+
+- **App icon.** LoadInMe has its own icon now: a blue upload arrow. It shows in
+  the browser tab, as the home-screen icon on phones, and in the page header.
 
 ## v0.8.0
 

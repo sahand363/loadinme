@@ -88,3 +88,5 @@ a { color: #0b57d0; }
 .lightbox-meta .row { display: flex; gap: 8px; }
 
 @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } .panel { min-height: 0; } }
+
+h1 .logo { width: 26px; height: 26px; border-radius: 7px; vertical-align: -5px; margin-right: 6px; }
